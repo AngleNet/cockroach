@@ -792,3 +792,521 @@ func (k EngineKey) Encode() []byte {
 ```
 
 This architectural deep dive demonstrates how CockroachDB achieves its design goals through careful layering, clear interfaces, and thoughtful trade-offs. Each layer is designed to be independently testable and maintainable while working together to provide a cohesive distributed SQL database system.
+
+## 3. Storage Layer Analysis
+
+### 3.1 Storage Engine Implementation
+
+CockroachDB's storage layer represents a sophisticated integration with Pebble, a high-performance key-value storage engine originally forked from RocksDB and heavily optimized for CockroachDB's specific requirements. The storage layer is responsible for durably persisting data while providing efficient access patterns for both reads and writes.
+
+#### 3.1.1 Pebble Integration Architecture
+
+The integration with Pebble is encapsulated in the `Pebble` struct, which serves as the primary interface between CockroachDB's higher layers and the underlying storage engine:
+
+```go
+// From pkg/storage/pebble.go
+type Pebble struct {
+    cfg         engineConfig
+    db          *pebble.DB
+    closed      bool
+    auxDir      string
+    ballastPath string
+    properties  roachpb.StoreProperties
+    
+    // Compaction concurrency control
+    cco compactionConcurrencyOverride
+    
+    // Performance metrics
+    writeStallCount      int64
+    writeStallDuration   time.Duration
+    diskSlowCount        int64
+    diskStallCount       int64
+    
+    // Iterator statistics
+    iterStats struct {
+        syncutil.Mutex
+        AggregatedIteratorStats
+    }
+    
+    // Batch commit statistics
+    batchCommitStats struct {
+        syncutil.Mutex
+        AggregatedBatchCommitStats
+    }
+}
+```
+
+This structure maintains critical state about the storage engine, including configuration, performance metrics, and various callbacks for system events.
+
+#### 3.1.2 Key-Value Storage Format
+
+CockroachDB uses a sophisticated key encoding scheme that enables efficient storage and retrieval of versioned data. The key space is divided into several categories:
+
+1. **System Keys**: Used for internal metadata and system tables
+2. **Table Data Keys**: Store actual user data
+3. **Lock Table Keys**: Track transaction locks separately from data
+
+The key encoding is implemented through the `EngineKey` interface:
+
+```go
+// From pkg/storage/engine_key.go
+type EngineKey struct {
+    Key     roachpb.Key
+    Version MVCCKeyVersion
+}
+
+// EngineKeySchema defines how keys are encoded
+var EngineKeySchema = struct {
+    // Lock table keys are prefixed with LocalRangeLockTablePrefix
+    LockTablePrefix []byte
+    // MVCC keys encode version information
+    VersionSuffixFormat string
+}
+```
+
+#### 3.1.3 Storage Configuration
+
+The storage engine is highly configurable to accommodate different workload characteristics:
+
+```go
+// From pkg/storage/pebble.go
+func DefaultPebbleOptions() *pebble.Options {
+    opts := &pebble.Options{
+        Comparer:           EngineComparer,
+        KeySchemas:         KeySchemas,
+        FS:                 vfs.Default,
+        FormatMajorVersion: pebble.FormatLatest,
+        
+        // Cache configuration
+        Cache:        pebble.NewCache(defaultCacheSize),
+        
+        // Compaction settings
+        Levels: []pebble.LevelOptions{
+            // L0 configuration
+            {TargetFileSize: 2 * 1024 * 1024},  // 2MB
+            // L1-L6 configuration with exponentially larger files
+        },
+        
+        // Write buffer configuration
+        MemTableSize:                64 * 1024 * 1024,  // 64MB
+        MemTableStopWritesThreshold: 4,
+        
+        // Background operation limits
+        MaxConcurrentCompactions: defaultMaxConcurrentCompactions,
+    }
+    return opts
+}
+```
+
+### 3.2 MVCC Implementation
+
+Multi-Version Concurrency Control (MVCC) is fundamental to CockroachDB's transaction isolation and consistency guarantees. The MVCC layer maintains multiple versions of each key, enabling lock-free reads and consistent snapshots.
+
+#### 3.2.1 MVCC Key Structure
+
+MVCC keys encode both the user key and a timestamp, creating a versioned history:
+
+```go
+// From pkg/storage/mvcc_key.go
+type MVCCKey struct {
+    Key       roachpb.Key
+    Timestamp hlc.Timestamp
+}
+
+// MVCCValue wraps the actual value with metadata
+type MVCCValue struct {
+    Value roachpb.Value
+    MVCCValueHeader
+}
+
+type MVCCValueHeader struct {
+    LocalTimestamp   hlc.ClockTimestamp
+    OriginID         uint32
+    OriginTimestamp  hlc.Timestamp
+    ImportEpoch      uint32
+}
+```
+
+The timestamp ordering ensures that newer versions appear first during iteration, optimizing for recent data access.
+
+#### 3.2.2 Write Operations
+
+MVCC writes create new versions without modifying existing data:
+
+```go
+// From pkg/storage/mvcc.go
+func MVCCPut(
+    ctx context.Context,
+    rw ReadWriter,
+    key roachpb.Key,
+    timestamp hlc.Timestamp,
+    value roachpb.Value,
+    opts MVCCWriteOptions,
+) (roachpb.LockAcquisition, error) {
+    // Create versioned key
+    mvccKey := MVCCKey{Key: key, Timestamp: timestamp}
+    
+    // Handle transaction intents
+    if opts.Txn != nil {
+        // Write intent metadata
+        meta := &enginepb.MVCCMetadata{
+            Txn:       &opts.Txn.TxnMeta,
+            Timestamp: timestamp.ToLegacyTimestamp(),
+        }
+        // Write provisional value
+    }
+    
+    // Write the actual value
+    return mvccPutInternal(ctx, rw, mvccKey, value, opts)
+}
+```
+
+#### 3.2.3 Read Operations
+
+MVCC reads navigate the version history to find the appropriate value:
+
+```go
+// From pkg/storage/mvcc.go
+func MVCCGet(
+    ctx context.Context,
+    reader Reader,
+    key roachpb.Key,
+    timestamp hlc.Timestamp,
+    opts MVCCGetOptions,
+) (MVCCGetResult, error) {
+    iter := reader.NewMVCCIterator(MVCCKeyAndIntentsIterKind, IterOptions{
+        KeyTypes:     IterKeyTypePointsAndRanges,
+        ReadCategory: opts.ReadCategory,
+    })
+    defer iter.Close()
+    
+    // Seek to the first version at or below the read timestamp
+    iter.SeekGE(MVCCKey{Key: key, Timestamp: timestamp})
+    
+    // Handle intents and find the appropriate version
+    value, intent, err := mvccGet(ctx, iter, key, timestamp, opts)
+    
+    return MVCCGetResult{
+        Value:  value.ToPointer(),
+        Intent: intent,
+    }, err
+}
+```
+
+#### 3.2.4 Intent Resolution
+
+Write intents represent provisional values written by uncommitted transactions:
+
+```go
+// From pkg/storage/mvcc.go
+func MVCCResolveWriteIntent(
+    ctx context.Context,
+    rw ReadWriter,
+    ms *enginepb.MVCCStats,
+    update roachpb.LockUpdate,
+    opts MVCCResolveWriteIntentOptions,
+) (bool, int64, *roachpb.Span, bool, error) {
+    // Read existing metadata
+    meta, err := readIntentMetadata(rw, update.Key)
+    if err != nil {
+        return false, 0, nil, false, err
+    }
+    
+    // Resolve based on transaction status
+    if update.Status == roachpb.COMMITTED {
+        // Convert intent to committed value
+        return mvccCommitIntent(ctx, rw, meta, update)
+    } else {
+        // Remove intent and provisional value
+        return mvccAbortIntent(ctx, rw, meta, update)
+    }
+}
+```
+
+### 3.3 Storage Optimizations and Trade-offs
+
+The storage layer implements numerous optimizations to balance performance, durability, and resource usage.
+
+#### 3.3.1 Write Amplification Mitigation
+
+Write amplification is a critical concern in LSM-tree based storage engines. CockroachDB addresses this through:
+
+1. **Adaptive Compression**: Different compression algorithms for different levels:
+
+```go
+// From pkg/storage/pebble.go
+var storeCompressionSettings = map[StoreCompressionSetting]pebble.DBCompressionSettings{
+    StoreCompressionSnappy:   pebble.UniformDBCompressionSettings(sstable.SnappyCompression),
+    StoreCompressionZstd:     pebble.UniformDBCompressionSettings(sstable.ZstdCompression),
+    StoreCompressionBalanced: pebble.DBCompressionBalanced,  // Adaptive per level
+}
+```
+
+2. **Compaction Concurrency Control**: Dynamic adjustment based on system load:
+
+```go
+// From pkg/storage/pebble.go
+func determineMaxConcurrentCompactions(
+    defaultValue int, 
+    envValue int, 
+    clusterSetting int,
+) int {
+    // Balance between system resources and compaction needs
+    if envValue > 0 && clusterSetting > 0 {
+        return max(envValue, clusterSetting)
+    }
+    // Default: min(3, numCPUs-1)
+    return defaultValue
+}
+```
+
+3. **Ingest-Time Splitting**: Allows SSTs to be split during ingestion for better level placement:
+
+```go
+var IngestSplitEnabled = settings.RegisterBoolSetting(
+    settings.SystemOnly,
+    "storage.ingest_split.enabled",
+    "enable ingest-time splitting to reduce write amplification",
+    true,
+)
+```
+
+#### 3.3.2 Read Performance Optimization
+
+Read performance is optimized through multiple mechanisms:
+
+1. **Bloom Filters**: Probabilistic data structures to avoid unnecessary disk reads:
+
+```go
+// From pkg/storage/pebble.go (in DefaultPebbleOptions)
+FilterPolicy: bloom.FilterPolicy(10),  // 10 bits per key
+FilterType:   pebble.TableFilter,
+```
+
+2. **Block Cache Management**: Intelligent caching of frequently accessed blocks:
+
+```go
+type blockCacheConfig struct {
+    size              int64
+    shardBits         int
+    strictCapacityLimit bool
+}
+
+func (c *blockCacheConfig) makeCache() *pebble.Cache {
+    return pebble.NewCache(c.size).WithShards(1 << c.shardBits)
+}
+```
+
+3. **Iterator Reuse**: Minimizing allocation overhead:
+
+```go
+// From pkg/storage/pebble_iterator.go
+type pebbleIterator struct {
+    iter    *pebble.Iterator
+    reusable bool
+    
+    // Iterator pool for reuse
+    pool *sync.Pool
+}
+```
+
+#### 3.3.3 Compaction Strategies
+
+The storage layer implements sophisticated compaction strategies to maintain read performance while controlling write amplification:
+
+```go
+// From pkg/storage/mvcc.go
+var l0SubLevelCompactionConcurrency = settings.RegisterIntSetting(
+    settings.ApplicationLevel,
+    "storage.l0_sublevel_concurrency",
+    "sub-level threshold for increased compaction concurrency",
+    2,
+)
+
+// Dynamic compaction triggering based on LSM shape
+func shouldTriggerCompaction(level int, fileCount int, totalSize int64) bool {
+    // Complex heuristics considering:
+    // - Number of files in level
+    // - Total size of level
+    // - Read amplification metrics
+    // - System resource availability
+}
+```
+
+### 3.4 Range Tombstones and Deletion Efficiency
+
+CockroachDB implements range tombstones for efficient bulk deletions:
+
+```go
+// From pkg/storage/mvcc.go
+func MVCCDeleteRangeUsingTombstone(
+    ctx context.Context,
+    rw ReadWriter,
+    ms *enginepb.MVCCStats,
+    startKey, endKey roachpb.Key,
+    timestamp hlc.Timestamp,
+) error {
+    // Write a range tombstone covering the entire span
+    rangeKey := MVCCRangeKey{
+        StartKey:  startKey,
+        EndKey:    endKey,
+        Timestamp: timestamp,
+    }
+    
+    // This avoids writing individual tombstones for each key
+    return rw.PutMVCCRangeKey(rangeKey, MVCCValue{})
+}
+```
+
+Range tombstones provide significant benefits:
+- **Space Efficiency**: Single tombstone covers entire key ranges
+- **Write Performance**: Avoid writing individual delete markers
+- **Compaction Efficiency**: Bulk removal during compaction
+
+### 3.5 Consistency and Durability Guarantees
+
+The storage layer provides strong consistency and durability guarantees through:
+
+#### 3.5.1 Write-Ahead Logging (WAL)
+
+All writes go through Pebble's WAL for durability:
+
+```go
+// From pkg/storage/pebble.go
+func (p *Pebble) ApplyBatchRepr(repr []byte, sync bool) error {
+    opts := pebble.WriteOptions{Sync: sync}
+    return p.db.Apply(repr, &opts)
+}
+```
+
+The `sync` parameter controls whether the WAL is synced to disk before returning, trading latency for durability.
+
+#### 3.5.2 Checkpointing
+
+Checkpoints provide consistent snapshots for backup and recovery:
+
+```go
+// From pkg/storage/pebble.go
+func (p *Pebble) CreateCheckpoint(dir string, spans []roachpb.Span) error {
+    opts := pebble.CheckpointOptions{
+        FlushWAL: true,
+        
+        // Restrict checkpoint to specific key spans
+        RestrictToSpans: makeEngineKeyRanges(spans),
+    }
+    
+    return p.db.Checkpoint(dir, opts)
+}
+```
+
+### 3.6 Memory Management
+
+The storage layer implements sophisticated memory management to balance performance and resource usage:
+
+```go
+// From pkg/storage/mvcc.go
+type MVCCScanOptions struct {
+    // Memory accounting for scan operations
+    MemoryAccount *mon.BoundAccount
+    
+    // Target bytes to limit memory usage
+    TargetBytes int64
+    
+    // Allow empty results if first key exceeds limit
+    AllowEmpty bool
+}
+
+func (opts *MVCCScanOptions) accountForKey(size int64) error {
+    if opts.MemoryAccount != nil {
+        return opts.MemoryAccount.Grow(context.Background(), size)
+    }
+    return nil
+}
+```
+
+### 3.7 Performance Monitoring
+
+The storage layer provides extensive metrics for performance monitoring:
+
+```go
+// From pkg/storage/pebble.go
+func (p *Pebble) GetMetrics() Metrics {
+    m := Metrics{
+        WriteStallCount:    atomic.LoadInt64(&p.writeStallCount),
+        WriteStallDuration: p.writeStallDuration,
+        DiskSlowCount:      atomic.LoadInt64(&p.diskSlowCount),
+        DiskStallCount:     atomic.LoadInt64(&p.diskStallCount),
+    }
+    
+    // Add Pebble-specific metrics
+    pm := p.db.Metrics()
+    m.Compact = CompactMetrics{
+        Count:               pm.Compact.Count,
+        Duration:            pm.Compact.Duration,
+        EstimatedDebt:       pm.Compact.EstimatedDebt,
+        InProgressBytes:     pm.Compact.InProgressBytes,
+    }
+    
+    return m
+}
+```
+
+### 3.8 Trade-offs in Storage Design
+
+The storage layer makes several important trade-offs:
+
+#### 3.8.1 LSM vs B-Tree
+
+CockroachDB chose LSM-trees (via Pebble) over B-trees:
+
+**Advantages**:
+- Better write throughput through sequential writes
+- Natural versioning support for MVCC
+- Efficient compression ratios
+- Good space amplification characteristics
+
+**Disadvantages**:
+- Higher read amplification requiring bloom filters
+- Background compaction overhead
+- Potential write stalls during heavy compaction
+
+#### 3.8.2 Synchronous vs Asynchronous Durability
+
+The system allows configurable durability guarantees:
+
+```go
+type DurabilityRequirement int
+
+const (
+    // StandardDurability syncs to disk before acknowledging
+    StandardDurability DurabilityRequirement = iota
+    
+    // GuaranteedDurability forces immediate sync
+    GuaranteedDurability
+)
+```
+
+This allows users to trade durability for performance based on their requirements.
+
+#### 3.8.3 Compression Trade-offs
+
+Different compression algorithms offer different trade-offs:
+
+- **Snappy**: Fast compression/decompression, moderate ratios
+- **Zstd**: Better compression ratios, higher CPU usage
+- **None**: Maximum performance, highest storage usage
+
+The adaptive compression feature automatically selects algorithms based on data characteristics and system load.
+
+### 3.9 Future Optimizations
+
+The storage layer continues to evolve with several optimizations in development:
+
+1. **Disaggregated Storage**: Separation of compute and storage for cloud deployments
+2. **Tiered Storage**: Automatic migration of cold data to cheaper storage
+3. **Advanced Compression**: Machine learning-based compression selection
+4. **MVCC Optimization**: Reducing the overhead of version tracking
+
+These optimizations maintain backward compatibility while improving performance and reducing operational costs.
+
+The storage layer's sophisticated design enables CockroachDB to provide strong consistency guarantees while maintaining high performance across diverse workloads. The careful balance of trade-offs and continuous optimization ensures the system can scale from single-node deployments to massive distributed clusters.

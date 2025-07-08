@@ -9,7 +9,7 @@
   - Overview of CockroachDB
   - Key design goals and principles
   - Architecture highlights
-- [ ] 1.2 System Architecture Deep Dive (5,000 words)
+- [x] 1.2 System Architecture Deep Dive (5,000 words)
   - Layered architecture analysis
   - Component interactions
   - Design patterns and trade-offs
