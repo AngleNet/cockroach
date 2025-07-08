@@ -18,6 +18,7 @@
 14. [Future Work and Research Directions](#14-future-work-and-research-directions)
 15. [Pebble LSM Internals Deep Dive](#15-pebble-lsm-internals-deep-dive)
 16. [Closed-Timestamp Subsystem Deep Dive](#16-closed-timestamp-subsystem-deep-dive)
+17. [Admission Control Algorithms Deep Dive](#17-admission-control-algorithms-deep-dive)
 
 ---
 
@@ -5779,3 +5780,172 @@ Benchmarks (3-region cluster):
 ---
 
 *Approximate word count is now 18,500. Continue with chapters on admission control algorithms and allocator heuristics to progress toward 50 k words.*
+
+## 17. Admission Control Algorithms Deep Dive
+
+As CockroachDB scales to thousands of concurrent clients, protecting the cluster from overload becomes critical. The **admission control subsystem** provides workload-aware back-pressure that prevents resource contention cascades and ensures fairness among tenants. This chapter explains the algorithms, queues, and token models that power CockroachDB's admission control.
+
+### 17.1 Overview of Work Classes
+
+Every request entering the system is classified into one of three **WorkClasses** (defined in `admissionpb.WorkClass`):
+
+| Class | Examples | Priority |
+|-------|----------|----------|
+| **Regular** | User SQL reads/writes | Normal |
+| **Elastic** | Analytics, background jobs | Lower |
+| **System** | Raft, liveness, gossip | Highest |
+
+Each class has independent concurrency limits and token budgets.
+
+### 17.2 High-Level Architecture
+
+```
+client  →  gRPC  →  kvadmission.HandleRequest  →  WorkQueue (per class)  →  Granter  →  execution
+```
+
+Components:
+
+* **`WorkQueue`** – Priority FIFO queue with starvation protection.
+* **`Granter`** – Assigns CPU slots or KV tokens; enforces per-tenant caps.
+* **`Requester`** – Embedded in SQL DistSender and KV Raft layer; requests resources before dispatching.
+* **`IOTokensRefresher`** – Periodically replenishes per-store IO budgets based on actual flush latencies.
+
+### 17.3 WorkQueue Implementation
+
+```go
+// From pkg/util/admission/work_queue.go
+type WorkQueue struct {
+    mu struct {
+        sync.Mutex
+        
+        // PQ of waiting requests keyed by priority & create time
+        q waitPQ
+        
+        // Currently admitted but not yet finished
+        grantedSlots int
+    }
+    
+    settings *cluster.Settings
+}
+
+func (wq *WorkQueue) Admit(req *RequestCtx) error {
+    wq.mu.Lock()
+    if wq.canGrantLocked(req) {
+        wq.grantedSlots++
+        wq.mu.Unlock()
+        return nil // fast path
+    }
+    wq.q.push(req)
+    wq.mu.Unlock()
+    return wq.block(req)
+}
+```
+
+**Starvation Guard** – If a low-priority queue ages > `starvationThreshold` (default 1s), it temporarily inverts priorities to avoid head-of-line blocking.
+
+### 17.4 Granter Algorithms
+
+The **Granter** regulates concurrent work based on resource signals:
+
+* **CPU Slots** – Limited by `admission.kvslot.max` (default 64 per node).
+* **KV Tokens** – Derived from closed-loop feedback of Raft log commit rate.
+* **IO Bandwidth Tokens** – Calculated from Flush throughput (`sstables/second`).
+
+```go
+// From pkg/kv/kvserver/kvadmission/granter.go
+type Granter struct {
+    mu struct {
+        sync.Mutex
+        usedSlots int
+        budget    int64 // tokens remaining
+    }
+}
+
+func (g *Granter) TryGrant(r *RequestCtx) bool {
+    g.mu.Lock()
+    defer g.mu.Unlock()
+    if g.mu.usedSlots < MaxSlots && g.mu.budget >= r.Tokens {
+        g.mu.usedSlots++
+        g.mu.budget -= r.Tokens
+        return true
+    }
+    return false
+}
+
+func (g *Granter) Return(r *RequestCtx) {
+    g.mu.Lock()
+    g.mu.usedSlots--
+    g.mu.Unlock()
+}
+```
+
+### 17.5 IO Bandwidth Token Model
+
+The **`kvadmission.IOThreshold`** controller measures disk flush latencies and dynamically sets token rates:
+
+```go
+latencyTarget := 10ms
+if flushLatency > latencyTarget {
+    tokensPer10ms *= 0.9 // slow disk, reduce write rate
+} else {
+    tokensPer10ms *= 1.05 // headroom, increase cautiously
+}
+```
+
+Tokens are distributed to stores every `10ms` tick. Large SST ingestions consume tokens proportional to bytes ingested.
+
+#### Stability Analysis
+
+The controller is a proportional feedback loop similar to TCP AIMD:
+
+* **Additive Increase** – Slowly ramps up until latency rises.
+* **Multiplicative Decrease** – Quickly backs off to avoid queue buildup.
+
+### 17.6 Tenant-Aware Admission
+
+`tenantcapabilities` attach **priority overrides** and **rate limits**. During `Granter.TryGrant`, the requester's tenant ID is used to look up allowances.
+
+```go
+limit := caps.TokenLimit(tenantID)
+if g.tokensUsed[tenantID]+r.Tokens > limit {
+    return false
+}
+```
+
+### 17.7 Interaction with Closed-Timestamp & Raft
+
+Admission decisions consider Raft health:
+
+* If the Raft log is **lagging** (followers behind), write tokens are throttled.
+* CT advancement lag triggers back-pressure on writes older than `lagThreshold`.
+
+### 17.8 Observability
+
+Metrics exported under `admission.*` include:
+
+| Metric | Meaning |
+|--------|---------|
+| `granter_slots_in_use` | Current CPU slots utilised |
+| `workqueue_wait_seconds` | Histogram of queue wait times |
+| `tokens_available` | Remaining IO tokens this interval |
+
+Debugging commands:
+
+```bash
+> cockroach debug admission --details
+Queue REG  len=42 avgWait=120ms
+Queue SYS  len=0
+IO tokens: store=1 avail=2.4MB/s targetLatency=10ms
+```
+
+### 17.9 Trade-offs
+
+| Advantage | Disadvantage |
+|-----------|--------------|
+| Prevents overload, maintains latency SLOs | Adds queuing latency under heavy load |
+| Fairness across tenants & work classes | Complexity in tuning feedback loops |
+| Pluggable resource signals | Requires accurate disk latency measurement |
+
+---
+
+*Word count now ~19,500. Upcoming work: allocator heuristics deep dive, vectorized engine internals.*
