@@ -686,7 +686,7 @@ func (nl *NodeLiveness) IsLive(nodeID roachpb.NodeID) (bool, error) {
 When a range loses replicas, the system automatically creates new ones:
 
 ```go
-// From pkg/kvserver/replicate_queue.go
+// From pkg/kv/kvserver/replicate_queue.go
 func (rq *replicateQueue) processOneChange(
     ctx context.Context, r *Replica,
 ) error {
@@ -2012,3 +2012,544 @@ The distributed architecture is designed to scale horizontally:
 4. **Multi-Region Support**: Native support for geo-distributed deployments
 
 The distributed systems core provides the foundation for CockroachDB's scalability, fault tolerance, and strong consistency guarantees. Through careful implementation of proven distributed systems algorithms and continuous optimization, the system achieves enterprise-grade reliability while maintaining operational simplicity.
+
+## 5. Transaction Processing
+
+### 5.1 Transaction Execution Flow
+
+CockroachDB implements a sophisticated distributed transaction system that provides ACID guarantees across a globally distributed cluster. The transaction processing layer is responsible for coordinating operations across multiple ranges while maintaining strong consistency.
+
+#### 5.1.1 Transaction Architecture
+
+At the core of transaction processing is the `Txn` struct, which coordinates all operations within a transaction:
+
+```go
+// From pkg/kv/txn.go
+type Txn struct {
+    db              *DB
+    typ             TxnType
+    gatewayNodeID   roachpb.NodeID
+    
+    mu struct {
+        syncutil.Mutex
+        ID           uuid.UUID
+        debugName    string
+        userPriority roachpb.UserPriority
+        
+        // Stateful sender for transaction coordination
+        sender TxnSender
+        
+        // Transaction deadline for bounded execution time
+        deadline hlc.Timestamp
+        
+        // Maximum auto-retries for handling conflicts
+        maxAutoRetries int
+    }
+    
+    // Admission control header for resource management
+    admissionHeader kvpb.AdmissionHeader
+}
+```
+
+#### 5.1.2 Transaction Types
+
+CockroachDB supports different transaction types for various use cases:
+
+```go
+// From pkg/kv/txn_type.go
+type TxnType int
+
+const (
+    // RootTxn is the originating transaction
+    RootTxn TxnType = iota
+    
+    // LeafTxn represents distributed execution fragments
+    LeafTxn
+)
+```
+
+Root transactions can spawn leaf transactions for distributed execution:
+
+```go
+// From pkg/kv/txn.go
+func NewLeafTxn(
+    ctx context.Context,
+    db *DB,
+    gatewayNodeID roachpb.NodeID,
+    tis *roachpb.LeafTxnInputState,
+) *Txn {
+    // Leaf transactions inherit state from parent
+    txn := &Txn{
+        db:            db,
+        typ:           LeafTxn,
+        gatewayNodeID: gatewayNodeID,
+    }
+    
+    // Initialize with parent transaction state
+    txn.mu.ID = tis.Txn.ID
+    txn.mu.sender = db.factory.LeafTransactionalSender(tis)
+    
+    return txn
+}
+```
+
+#### 5.1.3 Transaction Lifecycle
+
+The typical transaction lifecycle follows these stages:
+
+1. **Initialization**: Transaction created with initial timestamp
+2. **Execution**: Operations performed, possibly across multiple ranges
+3. **Commit/Abort**: Transaction finalized with two-phase commit avoidance
+
+```go
+// From pkg/kv/txn.go
+func (txn *Txn) exec(ctx context.Context, fn func(context.Context, *Txn) error) error {
+    // Execute transaction with automatic retry logic
+    retries := 0
+    maxRetries := txn.MaxAutoRetries()
+    
+    for {
+        err := fn(ctx, txn)
+        
+        if err == nil {
+            // Success - attempt to commit
+            return txn.Commit(ctx)
+        }
+        
+        // Check if error is retryable
+        if !errors.HasType(err, (*kvpb.TransactionRetryError)(nil)) {
+            return err
+        }
+        
+        // Prepare for retry
+        if retries >= maxRetries {
+            return ErrAutoRetryLimitExhausted
+        }
+        
+        if err := txn.PrepareForRetry(ctx); err != nil {
+            return err
+        }
+        
+        retries++
+    }
+}
+```
+
+### 5.2 MVCC Transactions
+
+Multi-Version Concurrency Control (MVCC) is fundamental to CockroachDB's transaction isolation:
+
+#### 5.2.1 Timestamp Management
+
+Transactions operate at specific timestamps, enabling consistent snapshots:
+
+```go
+// From pkg/kv/txn.go
+func (txn *Txn) ReadTimestamp() hlc.Timestamp {
+    txn.mu.Lock()
+    defer txn.mu.Unlock()
+    return txn.mu.sender.ReadTimestamp()
+}
+
+func (txn *Txn) SetFixedTimestamp(ctx context.Context, ts hlc.Timestamp) error {
+    txn.mu.Lock()
+    defer txn.mu.Unlock()
+    
+    // Fixed timestamps prevent the transaction from being pushed
+    return txn.mu.sender.SetFixedTimestamp(ts)
+}
+```
+
+#### 5.2.2 Read and Write Operations
+
+MVCC enables lock-free reads while maintaining consistency:
+
+```go
+// From pkg/kv/txn.go
+func (txn *Txn) Get(ctx context.Context, key interface{}) (KeyValue, error) {
+    b := txn.NewBatch()
+    b.Get(key)
+    if err := txn.Run(ctx, b); err != nil {
+        return KeyValue{}, err
+    }
+    return b.Results[0].Rows[0], nil
+}
+
+func (txn *Txn) Put(ctx context.Context, key, value interface{}) error {
+    b := txn.NewBatch()
+    b.Put(key, value)
+    return txn.Run(ctx, b)
+}
+```
+
+### 5.3 Isolation Levels
+
+CockroachDB supports multiple isolation levels with different consistency guarantees:
+
+#### 5.3.1 Serializable Isolation (Default)
+
+Serializable isolation provides the strongest consistency guarantees:
+
+```go
+// From pkg/kv/kvserver/concurrency/isolation/levels.go
+type Level int
+
+const (
+    Serializable Level = iota
+    Snapshot
+    ReadCommitted
+)
+
+func (txn *Txn) SetIsoLevel(isoLevel isolation.Level) error {
+    if txn.typ != RootTxn {
+        return errors.AssertionFailedf("SetIsoLevel() called on leaf txn")
+    }
+    
+    txn.mu.Lock()
+    defer txn.mu.Unlock()
+    return txn.mu.sender.SetIsoLevel(isoLevel)
+}
+```
+
+#### 5.3.2 Read Committed Isolation
+
+Read Committed provides weaker guarantees but better performance for certain workloads:
+
+```go
+// From pkg/kv/kvserver/concurrency/isolation/levels.go
+func (l Level) PerStatementReadSnapshot() bool {
+    // Read Committed uses per-statement snapshots
+    return l == ReadCommitted
+}
+
+func (l Level) GuaranteesLinearizability() bool {
+    // Only Serializable guarantees linearizability
+    return l == Serializable
+}
+```
+
+### 5.4 Distributed Transaction Protocol
+
+CockroachDB implements a distributed transaction protocol that avoids traditional two-phase commit overhead:
+
+#### 5.4.1 Transaction Coordination
+
+The transaction coordinator manages the distributed execution:
+
+```go
+// From pkg/kv/kvclient/kvcoord/txn_coord_sender.go
+type TxnCoordSender struct {
+    mu struct {
+        sync.Mutex
+        
+        // Transaction proto with current state
+        txn roachpb.Transaction
+        
+        // Active intents tracking
+        intents map[roachpb.Span][]roachpb.SequencedWrite
+        
+        // In-flight writes for pipelining
+        inflight *inFlightWrites
+    }
+    
+    // Interceptors for transaction logic
+    interceptorStack []txnInterceptor
+}
+```
+
+#### 5.4.2 Write Intents
+
+Write intents represent provisional values that may be committed or aborted:
+
+```go
+// From pkg/roachpb/data.proto
+type Intent struct {
+    Span   Span
+    Txn    enginepb.TxnMeta
+    Status TransactionStatus
+}
+
+// From pkg/kv/kvserver/batcheval/intent.go
+func WriteIntent(
+    ctx context.Context,
+    readWriter storage.ReadWriter,
+    key roachpb.Key,
+    value roachpb.Value,
+    txn *roachpb.Transaction,
+) error {
+    // Write provisional value with transaction metadata
+    meta := enginepb.MVCCMetadata{
+        Txn:       &txn.TxnMeta,
+        Timestamp: txn.WriteTimestamp.ToLegacyTimestamp(),
+    }
+    
+    return storage.MVCCPutIntent(ctx, readWriter, key, value, meta)
+}
+```
+
+#### 5.4.3 Parallel Commits
+
+The parallel commits optimization reduces commit latency:
+
+```go
+// From pkg/kv/kvserver/batcheval/cmd_end_transaction.go
+func IsParallelCommit(args *kvpb.EndTxnRequest) bool {
+    return args.Commit && len(args.InFlightWrites) > 0
+}
+
+func EvalEndTxn(
+    ctx context.Context,
+    readWriter storage.ReadWriter,
+    cArgs CommandArgs,
+    resp kvpb.Response,
+) (result.Result, error) {
+    args := cArgs.Args.(*kvpb.EndTxnRequest)
+    
+    if IsParallelCommit(args) {
+        // Parallel commit - transaction commits if all writes succeed
+        return evalParallelCommit(ctx, readWriter, cArgs, resp)
+    }
+    
+    // Standard commit path
+    return evalStandardCommit(ctx, readWriter, cArgs, resp)
+}
+```
+
+### 5.5 Transaction Conflicts and Resolution
+
+CockroachDB implements sophisticated conflict detection and resolution mechanisms:
+
+#### 5.5.1 Write-Write Conflicts
+
+Write-write conflicts occur when transactions attempt to modify the same key:
+
+```go
+// From pkg/kv/kvserver/concurrency/lock_table.go
+func (g *lockTableGuardImpl) CheckLocks() (bool, error) {
+    for {
+        state := g.mu.state
+        switch state.kind {
+        case waitFor:
+            // Wait for conflicting transaction
+            return false, g.waitForConflict(state)
+            
+        case waitElsewhere:
+            // Push conflicting transaction
+            return false, g.pushConflictingTxn(state)
+            
+        case doneWaiting:
+            // No conflicts - proceed
+            return true, nil
+        }
+    }
+}
+```
+
+#### 5.5.2 Write-Read Conflicts
+
+Write-read conflicts are handled through timestamp ordering:
+
+```go
+// From pkg/kv/kvserver/concurrency/concurrency_manager.go
+func (m *managerImpl) HandleWriterIntentError(
+    ctx context.Context,
+    g *Guard,
+    seq roachpb.LeaseSequence,
+    t *kvpb.WriteIntentError,
+) (*Guard, error) {
+    // Check if we can push the intent's timestamp
+    for _, intent := range t.Intents {
+        pusheeTxn := &intent.Txn
+        pushType := kvpb.PUSH_TIMESTAMP
+        
+        if ShouldPushImmediately(g.Req, pusheeTxn) {
+            // Push immediately for high-priority transactions
+            pushType = kvpb.PUSH_ABORT
+        }
+        
+        // Attempt to push conflicting transaction
+        if err := m.pushTransaction(ctx, pusheeTxn, pushType); err != nil {
+            return nil, err
+        }
+    }
+    
+    return g, nil
+}
+```
+
+#### 5.5.3 Deadlock Detection
+
+CockroachDB implements distributed deadlock detection:
+
+```go
+// From pkg/kv/kvserver/txnwait/queue.go
+type Queue struct {
+    mu struct {
+        sync.Mutex
+        
+        // Dependency graph for cycle detection
+        txns map[uuid.UUID]*waitingTxn
+    }
+}
+
+func (q *Queue) detectDeadlock(txnID uuid.UUID) bool {
+    // Perform depth-first search for cycles
+    visited := make(map[uuid.UUID]bool)
+    path := make(map[uuid.UUID]bool)
+    
+    return q.hasCycle(txnID, visited, path)
+}
+```
+
+### 5.6 Transaction Savepoints
+
+Savepoints allow partial rollback within transactions:
+
+```go
+// From pkg/kv/txn.go
+func (txn *Txn) CreateSavepoint(ctx context.Context) (SavepointToken, error) {
+    if txn.typ != RootTxn {
+        return SavepointToken{}, errors.AssertionFailedf(
+            "CreateSavepoint() called on leaf txn")
+    }
+    
+    txn.mu.Lock()
+    defer txn.mu.Unlock()
+    
+    // Capture current transaction state
+    return txn.mu.sender.CreateSavepoint(ctx)
+}
+
+func (txn *Txn) RollbackToSavepoint(ctx context.Context, s SavepointToken) error {
+    txn.mu.Lock()
+    defer txn.mu.Unlock()
+    
+    // Restore transaction to savepoint state
+    return txn.mu.sender.RollbackToSavepoint(ctx, s)
+}
+```
+
+### 5.7 Performance Optimizations
+
+The transaction layer includes numerous performance optimizations:
+
+#### 5.7.1 Write Pipelining
+
+Write pipelining allows subsequent operations without waiting for replication:
+
+```go
+// From pkg/kv/kvclient/kvcoord/txn_pipeliner.go
+type txnPipeliner struct {
+    // Tracks in-flight writes
+    ifWrites inFlightWrites
+    
+    // Maximum outstanding writes
+    maxBatchSize int
+}
+
+func (tp *txnPipeliner) SendLocked(
+    ctx context.Context,
+    ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
+    // Track writes that can be pipelined
+    for _, req := range ba.Requests {
+        if kvpb.IsIntentWrite(req) {
+            tp.ifWrites.insert(req.GetInner())
+        }
+    }
+    
+    // Send without waiting for replication
+    ba.AsyncConsensus = tp.canPipeline(ba)
+    
+    return tp.wrapped.SendLocked(ctx, ba)
+}
+```
+
+#### 5.7.2 Read Refresh
+
+Read refresh allows transactions to avoid restarts after timestamp pushes:
+
+```go
+// From pkg/kv/kvclient/kvcoord/txn_interceptor_span_refresher.go
+type txnSpanRefresher struct {
+    // Tracks reads for potential refresh
+    refreshFootprint condensableSpanSet
+    
+    // Maximum timestamp for refresh
+    refreshedTimestamp hlc.Timestamp
+}
+
+func (sr *txnSpanRefresher) sendLockedWithRefreshAttempts(
+    ctx context.Context,
+    ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
+    // Attempt to refresh reads if pushed
+    if pErr := sr.maybeRefreshAndRetry(ctx, ba); pErr != nil {
+        return nil, pErr
+    }
+    
+    // Send request
+    br, pErr := sr.wrapped.SendLocked(ctx, ba)
+    
+    if pErr != nil && sr.canRefreshAfterPush(pErr) {
+        // Try to refresh after push
+        if refreshErr := sr.tryRefreshTxnSpans(ctx); refreshErr == nil {
+            // Retry after successful refresh
+            return sr.sendLockedWithRefreshAttempts(ctx, ba)
+        }
+    }
+    
+    return br, pErr
+}
+```
+
+### 5.8 Transaction Metrics and Observability
+
+The transaction system provides comprehensive metrics:
+
+```go
+// From pkg/kv/kvserver/metrics.go
+type TxnMetrics struct {
+    Commits   *metric.Counter
+    Aborts    *metric.Counter
+    Refreshes *metric.Counter
+    
+    // Durations
+    CommitWait   *metric.Histogram
+    Durations    *metric.Histogram
+    
+    // Conflict metrics
+    WriteWriteConflicts *metric.Counter
+    WriteReadConflicts  *metric.Counter
+}
+```
+
+### 5.9 Trade-offs in Transaction Design
+
+The transaction processing layer makes several important trade-offs:
+
+#### 5.9.1 Consistency vs. Performance
+
+- **Strong Consistency**: Default serializable isolation ensures correctness
+- **Performance Options**: Weaker isolation levels available for specific use cases
+
+#### 5.9.2 Latency vs. Throughput
+
+- **Pipelining**: Reduces latency but increases complexity
+- **Batching**: Improves throughput but may increase individual operation latency
+
+#### 5.9.3 Optimistic vs. Pessimistic Concurrency
+
+CockroachDB uses optimistic concurrency control:
+
+**Advantages**:
+- No read locks required
+- Better performance under low contention
+- Enables read-only transaction optimization
+
+**Disadvantages**:
+- Higher abort rates under contention
+- Requires retry logic
+- Can lead to starvation in extreme cases
+
+The transaction processing layer is a critical component that enables CockroachDB to provide strong consistency guarantees while maintaining good performance across distributed deployments. Through careful protocol design and continuous optimization, the system achieves a balance between correctness and efficiency.

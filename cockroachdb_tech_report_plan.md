@@ -25,11 +25,11 @@
   - Compaction strategies
 
 ### Phase 3: Distributed Systems Core
-- [ ] 3.1 Range Management (4,000 words)
+- [x] 3.1 Range Management (4,000 words)
   - Range splitting/merging algorithms
   - Range metadata management
   - Rebalancing mechanisms
-- [ ] 3.2 Raft Consensus Implementation (5,000 words)
+- [x] 3.2 Raft Consensus Implementation (5,000 words)
   - Raft integration
   - Leader election
   - Log replication
