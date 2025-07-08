@@ -27,6 +27,16 @@
 23. [Transaction Span Refresher Internals Deep Dive](#23-transaction-span-refresher-internals-deep-dive)
 24. [Tenant Cost Control Deep Dive](#24-tenant-cost-control-deep-dive)
 25. [SQL Statistics Refresher Internals Deep Dive](#25-sql-statistics-refresher-internals-deep-dive)
+26. [Vectorized Expression Compiler Internals](#26-vectorized-expression-compiler-internals)
+27. [Rangefeed Backpressure and Lag Detection](#27-rangefeed-backpressure-and-lag-detection)
+28. [Gossip Anchor Bootstrapping and Network Partitions](#28-gossip-anchor-bootstrapping-and-network-partitions)
+29. [SQL Contention Events and Diagnostic Tables](#29-sql-contention-events-and-diagnostic-tables)
+30. [Span Config Subsystem Architecture](#30-span-config-subsystem-architecture)
+31. [Multi-Region Latency-Aware Admission Enhancements](#31-multi-region-latency-aware-admission-enhancements)
+32. [Leaseholder Rebalancing Algorithm 2.0](#32-leaseholder-rebalancing-algorithm-20)
+33. [Encryption Key Rotation and KMS Integration](#33-encryption-key-rotation-and-kms-integration)
+34. [Bulk SST Ingestion Path & Pebble Ingest Mechanism](#34-bulk-sst-ingestion-path-pebble-ingest-mechanism)
+35. [Planner–Admission Coordination for Tenant QoS](#35-planner-admission-coordination-for-tenant-qos)
 
 ---
 
@@ -6824,3 +6834,63 @@ Metrics:
 ---
 
 *Approx word count now 26,300. Next topics: vectorized expression compiler, rangefeed backpressure, gossip anchor bootstrapping.*
+
+## 26. Vectorized Expression Compiler Internals
+
+(Section draft placeholder – to be filled with details on expression compilation, constant folding, selection batchers, and template-based codegen.)
+
+---
+
+## 27. Rangefeed Backpressure and Lag Detection
+
+(Section draft placeholder – to be filled with rangefeed flow control tokens, lag observer metrics, catch-up scans.)
+
+---
+
+## 28. Gossip Anchor Bootstrapping and Network Partitions
+
+(Section draft placeholder – to be filled with gossip seed mechanics, bootstrapping anchors, partition healing.)
+
+---
+
+## 29. SQL Contention Events and Diagnostic Tables
+
+(Section draft placeholder – to be filled with contention event recording, system.statement_statistics schema.)
+
+---
+
+## 30. Span Config Subsystem Architecture
+
+(Section draft placeholder – to be filled with span config store, reconciliation worker, and KV subscriber.)
+
+---
+
+## 31. Multi-Region Latency-Aware Admission Enhancements
+
+(Section draft placeholder – to be filled with latency metrics, per-region queues, dynamic token adjustment.)
+
+---
+
+## 32. Leaseholder Rebalancing Algorithm 2.0
+
+(Section draft placeholder – to be filled with read lease preference scoring, rebalancing heuristics.)
+
+---
+
+## 33. Encryption Key Rotation and KMS Integration
+
+(Section draft placeholder – to be filled with envelope encryption model, key rotation workflow, and KMS driver API.)
+
+---
+
+## 34. Bulk SST Ingestion Path & Pebble Ingest Mechanism
+
+(Section draft placeholder – to be filled with AddSSTable evaluation, sideloaded storage, and ingest rate limiting.)
+
+---
+
+## 35. Planner–Admission Coordination for Tenant QoS
+
+(Section draft placeholder – to be filled with planner cost estimation feedback to admission controller, adaptive RU budgeting.)
+
+---
