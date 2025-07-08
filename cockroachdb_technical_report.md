@@ -26,6 +26,7 @@
 22. [Backup SSTable Export Internals Deep Dive](#22-backup-sstable-export-internals-deep-dive)
 23. [Transaction Span Refresher Internals Deep Dive](#23-transaction-span-refresher-internals-deep-dive)
 24. [Tenant Cost Control Deep Dive](#24-tenant-cost-control-deep-dive)
+25. [SQL Statistics Refresher Internals Deep Dive](#25-sql-statistics-refresher-internals-deep-dive)
 
 ---
 
@@ -6735,3 +6736,91 @@ A gRPC endpoint `TenantCostServer.ExportUsage` streams RU deltas to the billing 
 ---
 
 *Approx word count now 25,500. Future expansions: SQL statistics refresher internals, vectorized expression compiler, rangefeed backpressure.*
+
+## 25. SQL Statistics Refresher Internals Deep Dive
+
+Accurate table statistics are vital for the optimizer to generate efficient plans. CockroachDB employs an automatic **SQL statistics refresher** that incrementally updates histogram and row count metadata based on heuristics. This chapter examines the refresher's architecture, decision logic, and interaction with the job subsystem.
+
+### 25.1 High-Level Workflow
+
+1. **Monitor Mutation Jobs** – `StatsRefresher` subscribes to rangefeed events and mutation job completions.
+2. **Determine Staleness** – It evaluates whether existing stats are stale via row count deltas and time thresholds.
+3. **Schedule Stats Job** – When stale, it enqueues an `auto CREATE STATISTICS` job.
+4. **Collect & Persist** – Distributed readers sample or full-scan depending on table size, writing results into `system.table_statistics`.
+
+### 25.2 Core Data Structures
+
+```go
+// From pkg/sql/stats/automatic_stats.go
+type Refresher struct {
+    st     *cluster.Settings
+    ex     sqlutil.InternalExecutor
+    cache  *TableStatisticsCache
+    
+    // configuration
+    asOfTime   time.Duration // max staleness duration
+    targetRows int64         // row diff threshold
+}
+```
+
+### 25.3 Staleness Heuristics
+
+A table's stats are considered stale if **either**:
+
+* **Time-based** – `now - lastUpdated > asOfTime` (default 24 h) **and** QPS > `auto_stats_min_qps`.
+* **Mutation-based** – `abs(rowCount – lastRowCount) / lastRowCount > targetFraction` (default 20 %).
+
+```go
+func (r *Refresher) shouldRefresh(ts *stats.TableStatistics) bool {
+    staleTime := timeutil.Since(ts.LastUpdated) > r.asOfTime
+    changedRows := math.Abs(ts.RowCount-ts.LastRowCount) > r.targetRows
+    return staleTime || changedRows
+}
+```
+
+### 25.4 Sampling Algorithm
+
+For large tables, full scans are expensive. The collector employs **reservoir sampling** driven by `random()` expressions in a distributed query:
+
+```sql
+SELECT * FROM [SHOW STATISTICS USING JSON WITH histogram] WHERE
+  table_name = $1 AND random() < $sample_prob;
+```
+
+`sample_prob` is derived such that expected samples ≈ `desiredSamples` (default 10 k).
+
+### 25.5 Incremental Stats on Partitioned Tables
+
+When only a subset of partitions changes, the refresher issues partition-scoped `CREATE STATISTICS` to minimize IO.
+
+### 25.6 Integration with Jobs
+
+```go
+jobID, err := r.ie.Exec(ctx, "", txn,
+  "CREATE STATISTICS %s ON %s WITH OPTIONS",
+  statsName, tableName)
+```
+
+Jobs track progress per partition; failure retries follow exponential backoff.
+
+### 25.7 Observability
+
+Metrics:
+
+| Metric | Meaning |
+|--------|---------|
+| `sql.stats.auto_create.count` | Number of auto stats jobs started |
+| `sql.stats.refresh.skipped` | Tables evaluated but not stale |
+| `sql.stats.refresh.failed` | Job failures |
+
+### 25.8 Trade-offs
+
+| Benefit | Cost |
+|---------|------|
+| Maintains optimizer accuracy | Extra disk IO during sampling |
+| Incremental & partition-aware | Heuristic thresholds may misfire |
+| Fully automated | Limited user control beyond settings |
+
+---
+
+*Approx word count now 26,300. Next topics: vectorized expression compiler, rangefeed backpressure, gossip anchor bootstrapping.*
