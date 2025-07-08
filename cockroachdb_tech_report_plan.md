@@ -74,6 +74,18 @@
 - [x] 8.1 Performance Optimizations (2,000 words)
 - [x] 8.2 Observability and Debugging (2,000 words)
 
+### Phase 9: Upcoming Deep-Dive Chapters
+- [ ] 9.1 Vectorized Expression Compiler Internals
+- [ ] 9.2 Rangefeed Backpressure and Lag Detection
+- [ ] 9.3 Gossip Anchor Bootstrapping and Network Partitions
+- [ ] 9.4 SQL Contention Events and Diagnostic Tables
+- [ ] 9.5 Span Config Subsystem Architecture
+- [ ] 9.6 Multi-Region Latency-Aware Admission Enhancements
+- [ ] 9.7 Leaseholder Rebalancing Algorithm 2.0
+- [ ] 9.8 Encryption Key Rotation and KMS Integration
+- [ ] 9.9 Bulk SST Ingestion Path & Pebble Ingest Mechanism
+- [ ] 9.10 Planner–Admission Coordination for Tenant QoS
+
 ## Methodology:
 1. For each section:
    - Analyze source code
