@@ -21,6 +21,7 @@
 17. [Admission Control Algorithms Deep Dive](#17-admission-control-algorithms-deep-dive)
 18. [Allocator Heuristics Deep Dive](#18-allocator-heuristics-deep-dive)
 19. [Vectorized Execution Internals Deep Dive](#19-vectorized-execution-internals-deep-dive)
+20. [Optimizer Rule Engine Deep Dive](#20-optimizer-rule-engine-deep-dive)
 
 ---
 
@@ -6225,3 +6226,134 @@ Compilers auto-vectorize this loop into AVX2 instructions.
 ---
 
 *Approx word count ≈ 21,500. Additional deep dives (optimizer rule engine, Raft log truncation) will continue progress toward 50 k words.*
+
+## 20. Optimizer Rule Engine Deep Dive
+
+CockroachDB's cost-based optimizer (CBO) is built on top of the **Cascades** framework, using memoization and transformation rules to explore alternative query plans. This chapter examines the rule engine, normalization vs. exploration phases, and custom rule writing.
+
+### 20.1 Memo Structure
+
+```go
+// From pkg/sql/opt/memo/memo.go
+type Memo struct {
+    metadata   *opt.Metadata
+    root       memo.GroupID
+    
+    // groups hold expressions with the same logical properties
+    groups     []group
+}
+
+struct group {
+    exprs   []RelExpr  // multiple physical variants
+    best    bestExpr   // cheapest expr chosen by optimizer
+    props   physical.Required
+}
+```
+
+Each SQL statement is parsed into an **OptBuilder** which builds an initial memo tree.
+
+### 20.2 Canonicalization Rules (Normalization)
+
+Normalization produces a canonical logical tree (eliminate syntactic variants) using **Normalize** pass in `opt/norm`.
+
+Example rule (YAML):
+
+```yaml
+# Push filter into join input when referencing only left columns.
+[PushFilterIntoLeftJoinInput, Normalize]
+(Select (InnerJoin $left:* $right:* $on:*) $filter:*)
+    ├── (ColumnsSubset $filter $left)
+=>
+(InnerJoin
+    (Select $left $filter)
+    $right $on)
+```
+
+Generated Go:
+
+```go
+func enforcePushFilterIntoLeftJoin(b *norm.Factory, e *memo.SelectExpr) {
+    if !subsetCols(e.Filter, e.Input.(*memo.InnerJoinExpr).Left) { return }
+    newLeft := b.ConstructSelect(e.Input.Left, e.Filter)
+    b.Replace(e, b.ConstructInnerJoin(newLeft, e.Input.Right, e.Input.On))
+}
+```
+
+### 20.3 Exploration Rules
+
+Exploration rules enumerate alternative physical implementations (hash join vs. merge join, index scan vs. table scan).
+
+```yaml
+# Use index if filter covers prefix.
+[CoveringIndexScan, Explore]
+(Select (Scan $tab) $filter:*)
+    ├── (HasIndex $tab idx)
+    ├── (Covers $filter idx.Prefix)
+=>
+(IndexScan $tab idx $filter)
+```
+
+The optimizer explores the search space via **branch-and-bound**: if a candidate's bound exceeds current best cost, exploration is pruned.
+
+### 20.4 Cost Model Details
+
+Key cost components:
+
+* **CPU Cost** – proportional to estimated row count × operation cost factor.
+* **Disk IO** – seeks and sequential reads; penalizes table scans.
+* **Network Cost** – inter-node bytes × RTT for distributed operators.
+
+Derived in `pkg/sql/opt/cost/cost.go`.
+
+```go
+func (c *coster) getHashJoinCost(rowsLeft, rowsRight optimizer.RowCount) cost.Cost {
+    return cpuCostFactor*(rowsLeft+rowsRight) + hashCostFactor*(rowsLeft+rowsRight)
+}
+```
+
+### 20.5 Statistics Derivation
+
+Histograms and distinct counts are stored in system tables. The builder injects them into the memo:
+
+```go
+ndv := statsBuilder.DistinctCount(col)
+rowCount := statsBuilder.TableRowCount(tabID)
+sel := selectivity.Estimate(filter)
+```
+
+### 20.6 Diagnostic Facilities
+
+`EXPLAIN ANALYZE (OPT, VERBOSE)` prints rule application steps and memo groups.
+
+```sql
+SELECT * FROM crdb_internal.optimizer_rule_stats;
+```
+
+Sample output:
+
+| Rule | Applications | Matches |
+|------|--------------|---------|
+| `PushSelectIntoJoin` | 4 | 1 |
+| `CoveringIndexScan` | 2 | 1 |
+
+### 20.7 Custom Rule Development
+
+Developers can prototype new rules via declarative YAML under `pkg/sql/opt/rules/`. The code generator (`optgen`) builds Go visitors automatically.
+
+```yaml
+[ElideDistinctOnPK, Normalize]
+(DistinctOn (Scan $tab) _) ├── (HasPrimaryKey $tab)
+=> (Scan $tab)
+```
+
+### 20.8 Trade-offs
+
+| Benefit | Cost |
+|---------|------|
+| Systematic search of plan space guarantees near-optimal plans | Large memo memory footprint |
+| Rule-based approach allows rapid iteration | Debugging rule interactions can be complex |
+| Separation of logical & physical phases | Requires accurate statistics for cost model |
+
+---
+
+*Approx word count now 22,500. Upcoming chapter: Raft log truncation & logstore management.*
