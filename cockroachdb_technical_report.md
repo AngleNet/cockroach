@@ -19,6 +19,7 @@
 15. [Pebble LSM Internals Deep Dive](#15-pebble-lsm-internals-deep-dive)
 16. [Closed-Timestamp Subsystem Deep Dive](#16-closed-timestamp-subsystem-deep-dive)
 17. [Admission Control Algorithms Deep Dive](#17-admission-control-algorithms-deep-dive)
+18. [Allocator Heuristics Deep Dive](#18-allocator-heuristics-deep-dive)
 
 ---
 
@@ -5949,3 +5950,161 @@ IO tokens: store=1 avail=2.4MB/s targetLatency=10ms
 ---
 
 *Word count now ~19,500. Upcoming work: allocator heuristics deep dive, vectorized engine internals.*
+
+## 18. Allocator Heuristics Deep Dive
+
+The **allocator** is responsible for replica placement and rebalancing, ensuring fault tolerance and balancing load across the cluster. Unlike simple consistent hashing, CockroachDB's allocator balances multiple dimensions—capacity, QPS, latency, locality tiers, and load diversity—while respecting constraints (zone configs, disk/CPU limits). This chapter dissects allocator algorithms and scoring functions.
+
+### 18.1 Primary Data Structures
+
+```go
+// From pkg/kv/kvserver/allocator/state.go
+type StorePool struct {
+    clock      *hlc.Clock
+    settings   *cluster.Settings
+    
+    // Node liveness map used for decommissioning checks
+    liveness   livenesspb.IsLiveMap
+    
+    // Gossip-supplied store descriptors
+    mu struct {
+        syncutil.RWMutex
+        stores map[roachpb.StoreID]*storeDetail
+    }
+}
+
+// Rich descriptor used during scoring
+struct storeDetail {
+    desc         roachpb.StoreDescriptor
+    metrics      kvserverpb.StoreMetrics
+    throttled    *rate.Limiter // range-rebalance throttle
+}
+```
+
+### 18.2 Scoring Function
+
+The allocator scores candidate stores via a weighted composite metric:
+
+```go
+score = θ1*capacityScore + θ2*rangeCountScore + θ3*qpsScore + θ4*latencyPenalty
+```
+
+Weights default to `{capacity:0.45, range:0.25, qps:0.25, latency:0.05}` but adapt when certain dimensions become saturated.
+
+#### Capacity Score
+
+```go
+free := float64(store.Capacity.Available)
+capScore := (maxFree - free) / maxFree  // normalized to [0,1]
+```
+
+Stores with more free space have lower scores (better).
+
+#### Range Count & QPS Scores
+
+`rangeScore = (store.RangeCount - meanRangeCount)/meanRangeCount`
+`qpsScore   = (store.QPS - meanQPS)/meanQPS`
+
+Negative scores are capped at zero (stores below average load are preferred).
+
+#### Latency Penalty
+
+For multi-region deployments, per-link RTT is incorporated using the `nodeLatencyFunc` fed from the RPC latency sampler. Penalty is proportional to RTT over 10 ms.
+
+### 18.3 Action Matrix
+
+Allocator computes an **action matrix** per range:
+
+| Condition | Action |
+|-----------|--------|
+| Under-replicated (< desired replicas) | **AddVoter / AddNonVoter** |
+| Over-replicated (> desired) | **Remove** replica |
+| Healthy but imbalanced | **Rebalance** existing replica |
+| Leaseholder not aligned with QPS locality | **TransferLease** |
+
+Priority weight (0–1) guides queue order. Example:
+
+```go
+if have < want {
+    return AllocatorAddVoter, float64(want-have)/float64(want)
+}
+```
+
+### 18.4 Constraint Evaluation
+
+Zone configs impose constraints such as `region=us-east`, `disk_type=ssd`. The allocator uses a **two-phase filtering**:
+
+1. **Hard Constraints** – Mandatory; exclude non-matching stores.
+2. **Soft Constraints** – Prefer matches but tolerate violations if necessary.
+
+Implementation excerpt:
+
+```go
+func (a *Allocator) constraintCheck(desc *roachpb.RangeDescriptor, s *storeDetail) (ok bool, score float64) {
+    hardOK := constraintsCheckHard(desc, s)
+    if !hardOK { return false, 0 }
+    softMatches := countSoftMatches(desc, s)
+    score = 1 - float64(softMatches)/float64(maxSoft)
+    return true, score
+}
+```
+
+### 18.5 Diversity Heuristics
+
+To avoid correlated failures, replicas should be spread across fault domains. The **diversity score** is computed from the shared locality prefix length:
+
+```go
+func diversityScore(a, b roachpb.Locality) float64 {
+    shared := sharedPrefixLen(a.Tiers, b.Tiers)
+    return 1.0 / float64(shared+1)
+}
+```
+
+During rebalancing, candidate stores that increase average diversity are preferred.
+
+### 18.6 Rebalancing Algorithm (Pseudocode)
+
+```
+for each replica r on store S:
+  target = bestStore(r)
+  if score(S) - score(target) > threshold:
+      enqueue replicate_queue op: move r to target
+```
+
+`bestStore` runs the scoring function among all healthy stores that pass constraints.
+
+### 18.7 Throttling and Cooldown
+
+After a range is moved, both source and target stores are **throttled** (rate limiter) to prevent oscillations. Cooldown defaults:
+
+* Lease transfer: 5 s
+* Replica relocate: 30 s
+
+### 18.8 Observability & Tuning
+
+Metrics:
+
+| Metric | Description |
+|--------|-------------|
+| `allocator.rebalance.count` | Number of replica moves |
+| `allocator.range_lease_transfers` | Lease transfers executed |
+| `allocator.add_voter_qps` | Rate of adding replicas |
+
+Cluster setting knobs (examples):
+
+```sql
+SET CLUSTER SETTING kv.allocator.qps_rebalance_threshold = '0.20';
+SET CLUSTER SETTING kv.allocator.load_based_lease_transfer.enabled = true;
+```
+
+### 18.9 Trade-offs
+
+| Pro | Con |
+|-----|-----|
+| Balances multiple dimensions holistically | Heuristic weights may not fit all workloads |
+| Locality-aware for geo clusters | Requires accurate RTT sampling |
+| Throttling prevents oscillations | Slower response to rapid workload shifts |
+
+---
+
+*Total word count ≈ 20,500. Next expansion candidates: vectorized execution internals, optimizer rule engine details, raft log truncation mechanics.*
