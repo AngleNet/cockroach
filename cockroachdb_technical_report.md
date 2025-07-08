@@ -167,3 +167,628 @@ CockroachDB's design emphasizes operational simplicity:
 - **Multi-Region Deployment**: Native support for geo-distributed deployments with configurable data placement policies.
 
 This introduction provides the foundation for understanding CockroachDB's architecture and implementation details that will be explored in depth throughout this report. Each subsequent section will dive deep into specific components, analyzing source code, discussing implementation trade-offs, and providing concrete examples of how the system achieves its design goals.
+
+## 2. System Architecture Deep Dive
+
+### 2.1 Layered Architecture Analysis
+
+CockroachDB's architecture is meticulously designed as a series of well-defined layers, each responsible for specific functionality while maintaining clean interfaces with adjacent layers. This layered approach enables modularity, testability, and the ability to reason about system behavior at different levels of abstraction.
+
+#### 2.1.1 The SQL Layer
+
+At the topmost level, the SQL layer (`/pkg/sql/`) serves as the primary interface between client applications and the distributed storage system. This layer is responsible for:
+
+1. **Connection Management**: The pgwire protocol implementation in `/pkg/sql/pgwire/` handles PostgreSQL-compatible client connections:
+
+```go
+// From pkg/sql/pgwire/server.go
+type Server struct {
+    AmbientCtx         log.AmbientContext
+    cfg                *base.Config
+    SQLServer          *sql.Server
+    execCfg            *sql.ExecutorConfig
+    
+    mu struct {
+        syncutil.RWMutex
+        connCount      int64
+        connections    map[net.Conn]struct{}
+        
+        // draining is set to true when the server starts draining the SQL 
+        // connections.
+        draining bool
+    }
+}
+```
+
+2. **Query Parsing and Analysis**: The parser, built using yacc and located in `/pkg/sql/parser/`, transforms SQL text into abstract syntax trees (AST). The parser is designed to be PostgreSQL-compatible while supporting CockroachDB-specific extensions:
+
+```go
+// From pkg/sql/parser/parse.go
+func Parse(sql string) (Statements, error) {
+    return parseWithDepth(1, sql)
+}
+
+func parseWithDepth(depth int, sql string) (Statements, error) {
+    s := scanner{
+        in:    sql,
+        depth: depth,
+    }
+    if yyParse(&s) != 0 {
+        return nil, s.lastError
+    }
+    return s.stmts, nil
+}
+```
+
+3. **Query Planning**: The planner transforms AST nodes into executable query plans. The planning process involves multiple phases:
+   - Semantic analysis and type checking
+   - Logical plan construction
+   - Physical plan generation
+   - Cost-based optimization
+
+The optimizer, located in `/pkg/sql/opt/`, implements a sophisticated cost-based query optimizer inspired by the Cascades framework:
+
+```go
+// From pkg/sql/opt/exec/execbuilder/builder.go
+type Builder struct {
+    factory            exec.Factory
+    optimizer          *opt.Optimizer
+    evalCtx            *eval.Context
+    
+    // withExprs is the set of With expressions which are currently being 
+    // built.
+    withExprs []builtWithExpr
+    
+    // subqueries tracks the subqueries that are part of scalar expressions
+    // we are currently building.
+    subqueries []exec.Subquery
+}
+```
+
+#### 2.1.2 The Transaction Layer
+
+The transaction layer (`/pkg/kv/`) provides ACID guarantees across distributed data. This layer implements:
+
+1. **Transaction Coordination**: Each transaction is managed by a coordinator that tracks write intents and ensures consistency:
+
+```go
+// From pkg/kv/txn.go
+type Txn struct {
+    db              *DB
+    typ             TxnType
+    gatewayNodeID   roachpb.NodeID
+    mu              struct {
+        syncutil.Mutex
+        
+        ID              uuid.UUID
+        debugName       string
+        sender          TxnSender
+        
+        // userPriority is the transaction's priority.
+        userPriority roachpb.UserPriority
+        
+        // txnAnchorKey is the key at which to anchor the transaction record.
+        txnAnchorKey roachpb.Key
+    }
+}
+```
+
+2. **Distributed Transaction Protocol**: CockroachDB implements a distributed transaction protocol that avoids traditional two-phase commit overhead through the use of write intents and transaction records:
+
+```go
+// From pkg/kv/kvserver/batcheval/transaction.go
+func updateIntentTxnStatus(
+    ctx context.Context,
+    readWriter storage.ReadWriter,
+    evalCtx EvalContext,
+    key roachpb.Key,
+    meta *enginepb.MVCCMetadata,
+    txn *roachpb.Transaction,
+    commit bool,
+) error {
+    // Implementation handles intent resolution based on transaction status
+}
+```
+
+#### 2.1.3 The Distribution Layer
+
+The distribution layer (`/pkg/kvserver/`) manages data distribution across the cluster:
+
+1. **Range Management**: Data is divided into ranges, each maintaining its own Raft group:
+
+```go
+// From pkg/kvserver/replica.go
+type Replica struct {
+    RangeID       roachpb.RangeID
+    store         *Store
+    abortSpan     *abortspan.AbortSpan
+    
+    mu struct {
+        syncutil.RWMutex
+        
+        // The destroyed status of a replica indicating if it's alive, 
+        // destroyed, or pending destruction.
+        destroyed destroyStatus
+        
+        // The state of the Raft state machine.
+        state storagepb.ReplicaState
+        
+        // The lease information.
+        lease roachpb.Lease
+    }
+}
+```
+
+2. **Load Balancing**: The system continuously monitors load distribution and rebalances data to maintain optimal performance:
+
+```go
+// From pkg/kvserver/allocator/allocator.go
+type Allocator struct {
+    storePool     *storepool.StorePool
+    nodeLatencyFn func(nodeID roachpb.NodeID) (time.Duration, bool)
+    
+    // scorerOptions configures the range rebalancing scorer.
+    scorerOptions *RangeRebalanceOptions
+}
+
+func (a *Allocator) ComputeAction(
+    ctx context.Context, conf roachpb.SpanConfig, desc *roachpb.RangeDescriptor,
+) (AllocatorAction, float64) {
+    // Determines whether a range needs rebalancing, upreplication, etc.
+}
+```
+
+#### 2.1.4 The Consensus Layer
+
+The consensus layer implements the Raft consensus algorithm to ensure consistency across replicas:
+
+```go
+// From pkg/raft/raft.go
+type raft struct {
+    id     uint64
+    Term   uint64
+    Vote   uint64
+    
+    // the log
+    raftLog *raftLog
+    
+    state StateType
+    
+    // isLearner is true if the local raft node is a learner.
+    isLearner bool
+    
+    msgs []pb.Message
+    
+    // the leader id
+    lead uint64
+    
+    // leadTransferee is id of the leader transfer target when its value is not zero.
+    leadTransferee uint64
+}
+```
+
+The Raft implementation includes numerous optimizations for production use:
+- Batched log entries
+- Coalesced heartbeats
+- Pre-vote phase to prevent disruption
+- Joint consensus for configuration changes
+
+#### 2.1.5 The Storage Layer
+
+At the lowest level, the storage layer (`/pkg/storage/`) interfaces with the Pebble storage engine:
+
+```go
+// From pkg/storage/pebble.go
+type Pebble struct {
+    db *pebble.DB
+    
+    closed      bool
+    readOnly    bool
+    path        string
+    auxDir      string
+    ballastPath string
+    
+    // Relevant options copied over from pebble.Options.
+    fs            vfs.FS
+    unencryptedFS vfs.FS
+    logger        pebble.Logger
+}
+```
+
+### 2.2 Component Interactions
+
+The interaction between layers follows a strict hierarchy, with each layer only communicating with adjacent layers through well-defined interfaces.
+
+#### 2.2.1 SQL to KV Translation
+
+When a SQL query is executed, it undergoes a complex transformation process:
+
+1. **Query Reception**: The pgwire server receives the query and creates a session context
+2. **Parsing**: The SQL text is parsed into an AST
+3. **Planning**: The AST is transformed into a logical plan, then optimized into a physical plan
+4. **Execution**: The plan is executed, generating KV operations
+
+Example of SQL to KV translation for a simple INSERT:
+
+```sql
+INSERT INTO users (id, name) VALUES (1, 'Alice');
+```
+
+This translates to KV operations:
+
+```go
+// Simplified representation
+Put(Key: /Table/53/1/1/0, Value: 'Alice')
+// Where: /Table/TableID/IndexID/PrimaryKey/ColumnID
+```
+
+#### 2.2.2 Transaction Flow
+
+A typical transaction flow through the layers:
+
+```go
+// Client initiates transaction
+BEGIN;
+INSERT INTO accounts (id, balance) VALUES (1, 100);
+UPDATE accounts SET balance = balance - 50 WHERE id = 1;
+COMMIT;
+```
+
+The flow proceeds as:
+
+1. **SQL Layer**: Creates a transaction object and coordinator
+2. **Transaction Layer**: Manages transaction state, tracks write intents
+3. **Distribution Layer**: Routes operations to appropriate ranges
+4. **Consensus Layer**: Ensures all replicas agree on the operations
+5. **Storage Layer**: Persists the data durably
+
+#### 2.2.3 Range Operations
+
+Range operations demonstrate the coordination between layers:
+
+```go
+// From pkg/kvserver/replica_send.go
+func (r *Replica) Send(
+    ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, *kvpb.Error) {
+    // Check lease
+    if err := r.checkExecutionCanProceed(ctx, ba); err != nil {
+        return nil, kvpb.NewError(err)
+    }
+    
+    // Route to appropriate handler
+    if ba.IsWrite() {
+        return r.executeWriteBatch(ctx, ba)
+    }
+    return r.executeReadOnlyBatch(ctx, ba)
+}
+```
+
+### 2.3 Design Patterns and Trade-offs
+
+CockroachDB's architecture embodies several key design patterns and makes specific trade-offs to achieve its goals.
+
+#### 2.3.1 Design Patterns
+
+1. **Command Pattern**: KV operations are encapsulated as commands that can be serialized, sent over the network, and replayed:
+
+```go
+// From pkg/kvpb/api.go
+type Request interface {
+    Method() Method
+    ShallowCopy() Request
+}
+
+type GetRequest struct {
+    RequestHeader
+    KeyLocking lock.Strength
+}
+
+type PutRequest struct {
+    RequestHeader
+    Value   roachpb.Value
+    Inline  bool
+}
+```
+
+2. **Strategy Pattern**: Different execution strategies for different operation types:
+
+```go
+// From pkg/sql/exec_factory.go
+type Factory interface {
+    // ConstructScan creates a node that scans a table.
+    ConstructScan(
+        table cat.Table,
+        index cat.Index,
+        needed exec.TableColumnOrdinalSet,
+        // ... more parameters
+    ) (exec.Node, error)
+    
+    // ConstructFilter creates a node that filters rows.
+    ConstructFilter(n exec.Node, filter tree.TypedExpr) (exec.Node, error)
+    
+    // ... more construction methods
+}
+```
+
+3. **Observer Pattern**: The gossip system implements a publish-subscribe mechanism for cluster metadata:
+
+```go
+// From pkg/gossip/gossip.go
+type Gossip struct {
+    mu struct {
+        syncutil.RWMutex
+        
+        // callbacks are invoked when gossip values change.
+        callbacks []*callback
+        
+        // info is the set of gossip values.
+        info infoStore
+    }
+}
+
+func (g *Gossip) RegisterCallback(pattern string, fn Callback) func() {
+    // Registers a callback for gossip updates
+}
+```
+
+#### 2.3.2 Architectural Trade-offs
+
+1. **Consistency vs. Availability**: CockroachDB prioritizes consistency, making ranges unavailable during network partitions if they cannot maintain a quorum. This is implemented through the Raft requirement for majority agreement:
+
+```go
+// Simplified quorum check
+func hasQuorum(replicas int, available int) bool {
+    return available > replicas/2
+}
+```
+
+2. **Latency vs. Throughput**: The system optimizes for throughput through batching, but this can increase latency for individual operations:
+
+```go
+// From pkg/kvserver/store_send.go
+type batcher struct {
+    // Batches are accumulated here before being sent
+    pending []kvpb.BatchRequest
+    
+    // Maximum time to wait before sending a partial batch
+    timeout time.Duration
+}
+```
+
+3. **Flexibility vs. Performance**: The SQL layer provides flexibility but adds overhead compared to direct KV operations. The system mitigates this through:
+   - Distributed SQL execution to push computation to data
+   - Vectorized execution engine for analytical queries
+   - Plan caching to avoid re-optimization
+
+4. **Simplicity vs. Features**: Some design choices favor simplicity:
+   - Single binary deployment (no separate coordinator/worker nodes)
+   - Symmetric node architecture (all nodes can serve all roles)
+   - Automatic sharding (no manual partition management)
+
+### 2.4 System Initialization and Bootstrap
+
+The system initialization process demonstrates the careful orchestration required to bootstrap a distributed system:
+
+```go
+// From pkg/server/init.go
+func (s *initServer) Bootstrap(
+    ctx context.Context, req *serverpb.BootstrapRequest,
+) (*serverpb.BootstrapResponse, error) {
+    // Phase 1: Validate cluster not already initialized
+    if err := s.checkBootstrapRequest(ctx, req); err != nil {
+        return nil, err
+    }
+    
+    // Phase 2: Create initial range descriptors
+    initialRanges := s.createInitialRanges()
+    
+    // Phase 3: Write initial system data
+    if err := s.writeInitialClusterData(ctx, initialRanges); err != nil {
+        return nil, err
+    }
+    
+    // Phase 4: Start Raft groups for system ranges
+    if err := s.startSystemRanges(ctx); err != nil {
+        return nil, err
+    }
+    
+    return &serverpb.BootstrapResponse{}, nil
+}
+```
+
+### 2.5 Runtime Architecture
+
+During runtime, the system maintains several critical subsystems:
+
+#### 2.5.1 Background Tasks
+
+CockroachDB runs numerous background tasks to maintain system health:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start gossip
+    n.startGossiping(ctx, n.stopper)
+    
+    // Start range lease renewal
+    n.stores.VisitStores(func(s *kvserver.Store) error {
+        s.StartLeaseRenewer(ctx)
+        return nil
+    })
+    
+    // Start metrics collection
+    n.startComputePeriodicMetrics(n.stopper, defaultMetricInterval)
+    
+    // Start time series maintenance
+    n.startTimeSeriesMaintenance(ctx)
+}
+```
+
+#### 2.5.2 Request Routing
+
+The system must route requests to the appropriate range lease holders:
+
+```go
+// From pkg/kv/kvclient/kvcoord/dist_sender.go
+type DistSender struct {
+    // Range cache for looking up range descriptors
+    rangeCache *rangecache.RangeCache
+    
+    // Transport for sending RPCs
+    transportFactory TransportFactory
+    
+    // Metrics
+    metrics DistSenderMetrics
+}
+
+func (ds *DistSender) Send(
+    ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
+    // Divide batch by ranges
+    parts := ds.divideAndSendBatchToRanges(ctx, ba)
+    
+    // Send to each range in parallel
+    return ds.parallelSend(ctx, parts)
+}
+```
+
+### 2.6 Failure Handling and Recovery
+
+The architecture includes comprehensive failure handling at each layer:
+
+#### 2.6.1 Node Failure Detection
+
+Node failures are detected through gossip heartbeats and Raft leadership:
+
+```go
+// From pkg/kvserver/liveness/liveness.go
+type NodeLiveness struct {
+    mu struct {
+        syncutil.RWMutex
+        
+        // Map of node ID to most recent liveness record
+        nodes map[roachpb.NodeID]Record
+    }
+}
+
+func (nl *NodeLiveness) IsLive(nodeID roachpb.NodeID) (bool, error) {
+    rec, exists := nl.mu.nodes[nodeID]
+    if !exists {
+        return false, ErrNoLivenessRecord
+    }
+    return rec.IsLive(nl.clock.Now()), nil
+}
+```
+
+#### 2.6.2 Range Recovery
+
+When a range loses replicas, the system automatically creates new ones:
+
+```go
+// From pkg/kvserver/replicate_queue.go
+func (rq *replicateQueue) processOneChange(
+    ctx context.Context, r *Replica,
+) error {
+    desc := r.Desc()
+    
+    // Check if we need to add/remove replicas
+    action, _ := rq.allocator.ComputeAction(ctx, r.SpanConfig(), desc)
+    
+    switch action {
+    case AllocatorAddVoter:
+        return rq.addReplica(ctx, r, VoterTarget)
+    case AllocatorRemoveVoter:
+        return rq.removeReplica(ctx, r, VoterTarget)
+    // ... other actions
+    }
+}
+```
+
+### 2.7 Performance Considerations
+
+The architecture includes numerous performance optimizations:
+
+#### 2.7.1 Batch Processing
+
+Operations are batched at multiple levels to amortize overhead:
+
+```go
+// From pkg/kvserver/replica_write.go
+func (r *Replica) proposeBatch(
+    ctx context.Context, ba *kvpb.BatchRequest,
+) (chan proposalResult, error) {
+    // Combine multiple requests into a single Raft proposal
+    proposal := &ProposalData{
+        command: &kvserverpb.RaftCommand{
+            BatchRequest: ba,
+        },
+    }
+    
+    return r.propose(ctx, proposal)
+}
+```
+
+#### 2.7.2 Parallel Execution
+
+The system exploits parallelism wherever possible:
+
+```go
+// From pkg/sql/distsql/server.go
+func (ds *ServerImpl) setupFlow(
+    ctx context.Context, req *execinfrapb.SetupFlowRequest,
+) (*execinfrapb.SimpleResponse, error) {
+    // Create processors in parallel
+    var wg sync.WaitGroup
+    for _, proc := range req.Processors {
+        wg.Add(1)
+        go func(p execinfrapb.ProcessorSpec) {
+            defer wg.Done()
+            ds.createProcessor(ctx, &p)
+        }(proc)
+    }
+    wg.Wait()
+}
+```
+
+### 2.8 Security Architecture
+
+Security is integrated throughout the layers:
+
+#### 2.8.1 Authentication and Authorization
+
+The SQL layer implements comprehensive security controls:
+
+```go
+// From pkg/sql/authorization.go
+type AuthorizationAccessor interface {
+    // CheckPrivilege verifies user has required privilege
+    CheckPrivilege(
+        ctx context.Context,
+        descriptor catalog.Descriptor,
+        privilege privilege.Kind,
+    ) error
+    
+    // RequireAdminRole verifies user has admin role
+    RequireAdminRole(ctx context.Context, action string) error
+}
+```
+
+#### 2.8.2 Encryption
+
+Data is encrypted at rest and in transit:
+
+```go
+// From pkg/storage/engine_key.go
+type EngineKey struct {
+    Key     roachpb.Key
+    Version storage.MVCCKeyVersion
+}
+
+// Encryption is handled transparently by the storage layer
+func (k EngineKey) Encode() []byte {
+    // Returns encrypted byte representation
+}
+```
+
+This architectural deep dive demonstrates how CockroachDB achieves its design goals through careful layering, clear interfaces, and thoughtful trade-offs. Each layer is designed to be independently testable and maintainable while working together to provide a cohesive distributed SQL database system.

@@ -5,7 +5,7 @@
 ## Todo List:
 
 ### Phase 1: Architecture Overview and Core Components
-- [ ] 1.1 Executive Summary and Introduction (2,000 words)
+- [x] 1.1 Executive Summary and Introduction (2,000 words)
   - Overview of CockroachDB
   - Key design goals and principles
   - Architecture highlights
