@@ -46,11 +46,11 @@
   - Transaction conflicts and resolution
 
 ### Phase 5: SQL Layer
-- [ ] 5.1 SQL Processing Pipeline (4,000 words)
+- [x] 5.1 SQL Processing Pipeline (4,000 words)
   - Query parsing and planning
   - Optimizer implementation
   - Execution engine
-- [ ] 5.2 Distributed SQL Execution (4,000 words)
+- [x] 5.2 Distributed SQL Execution (4,000 words)
   - DistSQL architecture
   - Physical plan generation
   - Processor scheduling

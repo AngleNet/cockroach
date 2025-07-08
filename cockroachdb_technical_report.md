@@ -3180,152 +3180,561 @@ The SQL layer successfully provides a familiar PostgreSQL interface while adapti
 
 ### 7.1 RPC Architecture
 
-CockroachDB uses gRPC for inter-node communication. The system implements a custom RPC framework that handles serialization and deserialization of messages, as well as connection management and load balancing.
+CockroachDB's networking layer is built on gRPC, providing efficient, reliable communication between nodes in the cluster. The system implements a sophisticated RPC framework that handles connection management, health checking, and circuit breaking.
 
-#### 7.1.1 Message Types
+#### 7.1.1 RPC Context
 
-CockroachDB defines several message types for different types of communication:
+The central component of the networking layer is the RPC Context, which manages all network connections:
 
-- **Request-Response**: Used for most operations
-- **Streaming**: Used for long-running operations
-- **Batch**: Used for batched operations
-- **Heartbeat**: Used for liveness monitoring
+```go
+// From pkg/rpc/context.go
+type Context struct {
+    ContextOptions
+    *SecurityContext
+    
+    RemoteClocks *RemoteClockMonitor
+    MasterCtx    context.Context
+    
+    // Connection pools
+    peers     peerMap[*grpc.ClientConn]
+    drpcPeers peerMap[drpc.Conn]
+    
+    // Metrics and monitoring
+    metrics *Metrics
+    
+    // Client interceptors for middleware
+    clientUnaryInterceptors  []grpc.UnaryClientInterceptor
+    clientStreamInterceptors []grpc.StreamClientInterceptor
+    
+    // Loopback optimization
+    loopbackDialFn func(context.Context) (net.Conn, error)
+}
+```
 
 #### 7.1.2 Connection Management
 
-The system maintains a pool of connections to each node, allowing for efficient reuse and load balancing:
+CockroachDB maintains persistent connections between nodes with automatic reconnection:
 
 ```go
-// From pkg/kv/kvclient/kvcoord/dist_sender.go
-type DistSender struct {
-    // Range cache for looking up range descriptors
-    rangeCache *rangecache.RangeCache
+// From pkg/rpc/peer.go
+type peerOptions[Conn rpcConn] struct {
+    target        string
+    nodeID        roachpb.NodeID
+    class         rpcbase.ConnectionClass
+    locality      roachpb.Locality
+    advertiseAddr string
     
-    // Transport for sending RPCs
-    transportFactory TransportFactory
+    // Connection factory
+    makeConn func(ctx context.Context) (Conn, error)
     
-    // Metrics
-    metrics DistSenderMetrics
+    // Health checking
+    testingKnobs testingKnobs
 }
 
-func (ds *DistSender) Send(
-    ctx context.Context, ba *kvpb.BatchRequest,
-) (*kvpb.BatchResponse, error) {
-    // Divide batch by ranges
-    parts := ds.divideAndSendBatchToRanges(ctx, ba)
+func (p *peer[Conn]) getConn(ctx context.Context) (Conn, error) {
+    p.mu.Lock()
+    state := p.mu.state
+    p.mu.Unlock()
     
-    // Send to each range in parallel
-    return ds.parallelSend(ctx, parts)
-}
-```
-
-### 7.2 Load Balancing
-
-The system uses consistent hashing to distribute requests evenly across nodes:
-
-```go
-// From pkg/kv/kvclient/kvcoord/dist_sender.go
-type DistSender struct {
-    // Range cache for looking up range descriptors
-    rangeCache *rangecache.RangeCache
-    
-    // Transport for sending RPCs
-    transportFactory TransportFactory
-    
-    // Metrics
-    metrics DistSenderMetrics
-}
-
-func (ds *DistSender) Send(
-    ctx context.Context, ba *kvpb.BatchRequest,
-) (*kvpb.BatchResponse, error) {
-    // Divide batch by ranges
-    parts := ds.divideAndSendBatchToRanges(ctx, ba)
-    
-    // Send to each range in parallel
-    return ds.parallelSend(ctx, parts)
-}
-```
-
-### 7.3 Failure Detection
-
-The system uses gossip to detect node failures:
-
-```go
-// From pkg/kv/kvserver/liveness/liveness.go
-type NodeLiveness struct {
-    mu struct {
-        syncutil.RWMutex
+    switch state {
+    case peerStateIdle:
+        // Initiate connection
+        return p.connect(ctx)
         
-        // Map of node ID to most recent liveness record
-        nodes map[roachpb.NodeID]Record
+    case peerStateConnecting:
+        // Wait for ongoing connection
+        return p.waitForConn(ctx)
+        
+    case peerStateConnected:
+        // Return existing connection
+        return p.mu.conn, nil
+        
+    case peerStateFailed:
+        // Check circuit breaker
+        if p.breaker.Ready() {
+            return p.connect(ctx)
+        }
+        return nil, p.breaker.Err()
+    }
+}
+```
+
+#### 7.1.3 Circuit Breaking
+
+The system implements circuit breakers to prevent cascading failures:
+
+```go
+// From pkg/util/circuit/breaker.go
+type Breaker struct {
+    mu struct {
+        sync.Mutex
+        
+        state       State
+        failures    int
+        lastFailure time.Time
+        
+        // Configuration
+        threshold      int
+        timeout        time.Duration
+        halfOpenProbes int
     }
 }
 
-func (nl *NodeLiveness) IsLive(nodeID roachpb.NodeID) (bool, error) {
-    rec, exists := nl.mu.nodes[nodeID]
-    if !exists {
-        return false, ErrNoLivenessRecord
+func (b *Breaker) Ready() bool {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    switch b.mu.state {
+    case StateClosed:
+        return true
+        
+    case StateOpen:
+        // Check if timeout has passed
+        if time.Since(b.mu.lastFailure) > b.mu.timeout {
+            b.mu.state = StateHalfOpen
+            b.mu.halfOpenProbes = 0
+            return true
+        }
+        return false
+        
+    case StateHalfOpen:
+        // Allow limited probes
+        return b.mu.halfOpenProbes < maxHalfOpenProbes
     }
-    return rec.IsLive(nl.clock.Now()), nil
 }
 ```
 
-### 7.4 Latency Measurement
+### 7.2 gRPC Integration
 
-The system uses latency measurements to monitor network performance:
+CockroachDB extends gRPC with custom functionality for distributed systems:
+
+#### 7.2.1 Custom Codecs
+
+The system implements custom codecs for efficient serialization:
 
 ```go
-// From pkg/kv/kvclient/kvcoord/dist_sender.go
-type DistSender struct {
-    // Range cache for looking up range descriptors
-    rangeCache *rangecache.RangeCache
-    
-    // Transport for sending RPCs
-    transportFactory TransportFactory
-    
-    // Metrics
-    metrics DistSenderMetrics
+// From pkg/rpc/codec.go
+type codec struct{}
+
+func (c codec) Marshal(v interface{}) ([]byte, error) {
+    if msg, ok := v.(protoutil.Message); ok {
+        // Use custom protobuf marshaling
+        return protoutil.Marshal(msg)
+    }
+    return nil, fmt.Errorf("unsupported type: %T", v)
 }
 
-func (ds *DistSender) Send(
-    ctx context.Context, ba *kvpb.BatchRequest,
-) (*kvpb.BatchResponse, error) {
-    // Divide batch by ranges
-    parts := ds.divideAndSendBatchToRanges(ctx, ba)
-    
-    // Send to each range in parallel
-    return ds.parallelSend(ctx, parts)
+func (c codec) Unmarshal(data []byte, v interface{}) error {
+    if msg, ok := v.(protoutil.Message); ok {
+        // Custom unmarshaling with size limits
+        return protoutil.Unmarshal(data, msg)
+    }
+    return fmt.Errorf("unsupported type: %T", v)
 }
 ```
 
-### 7.5 Security
+#### 7.2.2 Interceptors
 
-The system uses mutual TLS for authentication and encryption:
+CockroachDB uses gRPC interceptors for cross-cutting concerns:
 
 ```go
-// From pkg/kv/kvclient/kvcoord/dist_sender.go
-type DistSender struct {
-    // Range cache for looking up range descriptors
-    rangeCache *rangecache.RangeCache
-    
-    // Transport for sending RPCs
-    transportFactory TransportFactory
-    
-    // Metrics
-    metrics DistSenderMetrics
-}
-
-func (ds *DistSender) Send(
-    ctx context.Context, ba *kvpb.BatchRequest,
-) (*kvpb.BatchResponse, error) {
-    // Divide batch by ranges
-    parts := ds.divideAndSendBatchToRanges(ctx, ba)
-    
-    // Send to each range in parallel
-    return ds.parallelSend(ctx, parts)
+// From pkg/rpc/auth.go
+func (a kvAuth) AuthUnary() grpc.UnaryServerInterceptor {
+    return func(
+        ctx context.Context,
+        req interface{},
+        info *grpc.UnaryServerInfo,
+        handler grpc.UnaryHandler,
+    ) (interface{}, error) {
+        // Extract tenant ID from context
+        tenantID, err := a.getTenantID(ctx)
+        if err != nil {
+            return nil, err
+        }
+        
+        // Verify tenant capabilities
+        if err := a.tenant.authorize(tenantID, info.FullMethod); err != nil {
+            return nil, err
+        }
+        
+        // Add tenant ID to context
+        ctx = context.WithValue(ctx, tenantIDKey, tenantID)
+        
+        return handler(ctx, req)
+    }
 }
 ```
+
+### 7.3 Heartbeat and Health Checking
+
+The system implements a heartbeat mechanism for failure detection:
+
+#### 7.3.1 Heartbeat Service
+
+```go
+// From pkg/rpc/heartbeat.go
+type HeartbeatService struct {
+    clock              hlc.WallClock
+    remoteClockMonitor *RemoteClockMonitor
+    
+    nodeID           *base.NodeIDContainer
+    clusterID        *base.ClusterIDContainer
+    
+    onHandlePing func(context.Context, *PingRequest, *PingResponse) error
+    
+    testingAllowNamedRPCToAnonymousServer bool
+}
+
+func (hs *HeartbeatService) Ping(
+    ctx context.Context, req *PingRequest,
+) (*PingResponse, error) {
+    // Verify cluster ID
+    if req.ClusterID != nil && *req.ClusterID != hs.clusterID.Get() {
+        return nil, errors.Errorf("cluster ID mismatch")
+    }
+    
+    // Update remote clock
+    hs.remoteClockMonitor.UpdateOffset(ctx, req.NodeID, req.Offset)
+    
+    // Build response
+    resp := &PingResponse{
+        Pong:       req.Ping,
+        ServerTime: hs.clock.Now(),
+        NodeID:     hs.nodeID.Get(),
+        ClusterID:  &hs.clusterID.Get(),
+    }
+    
+    // Custom handler hook
+    if hs.onHandlePing != nil {
+        if err := hs.onHandlePing(ctx, req, resp); err != nil {
+            return nil, err
+        }
+    }
+    
+    return resp, nil
+}
+```
+
+#### 7.3.2 Connection Health Monitoring
+
+```go
+// From pkg/rpc/peer.go
+func (p *peer[Conn]) runHeartbeatLoop(ctx context.Context) {
+    ticker := time.NewTicker(p.rpcCtx.RPCHeartbeatInterval)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            if err := p.sendHeartbeat(ctx); err != nil {
+                // Mark connection as unhealthy
+                p.markFailed(err)
+                return
+            }
+            
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+
+func (p *peer[Conn]) sendHeartbeat(ctx context.Context) error {
+    ctx, cancel := context.WithTimeout(ctx, p.rpcCtx.RPCHeartbeatTimeout)
+    defer cancel()
+    
+    req := &PingRequest{
+        Ping:      uuid.MakeV4().String(),
+        NodeID:    p.rpcCtx.NodeID.Get(),
+        ClusterID: &p.rpcCtx.StorageClusterID.Get(),
+    }
+    
+    _, err := p.heartbeatClient.Ping(ctx, req)
+    return err
+}
+```
+
+### 7.4 Gossip Protocol
+
+CockroachDB implements a gossip protocol for cluster metadata dissemination:
+
+#### 7.4.1 Gossip Architecture
+
+```go
+// From pkg/gossip/gossip.go
+type Gossip struct {
+    mu struct {
+        sync.RWMutex
+        
+        // Node connectivity graph
+        incoming nodeSet
+        outgoing nodeSet
+        
+        // Information store
+        info infoStore
+        
+        // Callbacks for updates
+        callbacks []*callback
+    }
+    
+    // Configuration
+    server   *server
+    client   *client
+    
+    // Node descriptor
+    nodeID   *base.NodeIDContainer
+    locality roachpb.Locality
+}
+```
+
+#### 7.4.2 Information Dissemination
+
+The gossip protocol efficiently spreads information across the cluster:
+
+```go
+// From pkg/gossip/gossip.go
+func (g *Gossip) AddInfo(key string, val []byte, ttl time.Duration) error {
+    g.mu.Lock()
+    defer g.mu.Unlock()
+    
+    // Add to local store
+    info := g.mu.info.addInfo(key, val, ttl)
+    
+    // Trigger callbacks
+    g.maybeTriggerCallbacksLocked(info)
+    
+    // Mark for propagation
+    g.mu.outgoing.addToPending(info)
+    
+    return nil
+}
+
+func (g *Gossip) gossipLoop(ctx context.Context) {
+    ticker := time.NewTicker(gossipInterval)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            // Select random peer
+            peer := g.selectPeer()
+            if peer == nil {
+                continue
+            }
+            
+            // Exchange information
+            delta := g.mu.info.delta(peer.highWaterStamps)
+            if len(delta) > 0 {
+                if err := peer.gossip(ctx, delta); err != nil {
+                    g.removePeer(peer)
+                }
+            }
+            
+        case <-ctx.Done():
+            return
+        }
+    }
+}
+```
+
+### 7.5 Network Security
+
+CockroachDB implements comprehensive security measures for network communication:
+
+#### 7.5.1 TLS Configuration
+
+```go
+// From pkg/rpc/tls.go
+func (rpcCtx *Context) GetServerTLSConfig() (*tls.Config, error) {
+    cfg, err := rpcCtx.SecurityContext.GetServerTLSConfig()
+    if err != nil {
+        return nil, err
+    }
+    
+    // Configure cipher suites
+    cfg.CipherSuites = []uint16{
+        tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    }
+    
+    // Minimum TLS version
+    cfg.MinVersion = tls.VersionTLS12
+    
+    // Client authentication
+    cfg.ClientAuth = tls.RequireAndVerifyClientCert
+    
+    return cfg, nil
+}
+```
+
+#### 7.5.2 Authentication and Authorization
+
+```go
+// From pkg/rpc/auth_tenant.go
+type tenantAuthorizer struct {
+    tenantID               roachpb.TenantID
+    capabilitiesAuthorizer tenantcapabilities.Authorizer
+}
+
+func (a tenantAuthorizer) authorize(
+    tenantID roachpb.TenantID,
+    method string,
+) error {
+    // System tenant has full access
+    if tenantID == roachpb.SystemTenantID {
+        return nil
+    }
+    
+    // Check tenant capabilities
+    cap, found := a.capabilitiesAuthorizer.GetCapabilities(tenantID)
+    if !found {
+        return errors.Errorf("tenant %d not found", tenantID)
+    }
+    
+    // Verify method access
+    if !cap.CanUseRPCMethod(method) {
+        return errors.Errorf("tenant %d not authorized for %s", tenantID, method)
+    }
+    
+    return nil
+}
+```
+
+### 7.6 Performance Optimizations
+
+The networking layer includes several performance optimizations:
+
+#### 7.6.1 Connection Pooling
+
+Connections are pooled and reused to minimize overhead:
+
+```go
+// From pkg/rpc/peer_map.go
+type peerMap[Conn rpcConn] struct {
+    mu struct {
+        sync.RWMutex
+        m map[peerKey]*peer[Conn]
+    }
+}
+
+func (pm *peerMap[Conn]) getOrCreate(
+    k peerKey,
+    peerOpts *peerOptions[Conn],
+) *peer[Conn] {
+    pm.mu.RLock()
+    p, ok := pm.mu.m[k]
+    pm.mu.RUnlock()
+    
+    if ok {
+        return p
+    }
+    
+    // Create new peer under write lock
+    pm.mu.Lock()
+    defer pm.mu.Unlock()
+    
+    // Double-check
+    if p, ok := pm.mu.m[k]; ok {
+        return p
+    }
+    
+    // Create new peer
+    p = newPeer(peerOpts)
+    pm.mu.m[k] = p
+    
+    return p
+}
+```
+
+#### 7.6.2 Loopback Optimization
+
+Local calls bypass the network stack:
+
+```go
+// From pkg/rpc/context.go
+func (rpcCtx *Context) GetLocalInternalClientForAddr(
+    nodeID roachpb.NodeID,
+) RestrictedInternalClient {
+    if rpcCtx.localInternalClient != nil && nodeID == rpcCtx.NodeID.Get() {
+        return rpcCtx.localInternalClient
+    }
+    return nil
+}
+```
+
+#### 7.6.3 Compression
+
+The system supports optional compression for large messages:
+
+```go
+// From pkg/rpc/snappy.go
+type snappyCompressor struct {
+    writeBuf []byte
+    readBuf  []byte
+}
+
+func (s *snappyCompressor) Compress(w io.Writer) (io.WriteCloser, error) {
+    return &snappyWriter{
+        Writer: snappy.NewBufferedWriter(w),
+        buf:    &s.writeBuf,
+    }, nil
+}
+
+func (s *snappyCompressor) Decompress(r io.Reader) (io.Reader, error) {
+    return &snappyReader{
+        Reader: snappy.NewReader(r),
+        buf:    &s.readBuf,
+    }, nil
+}
+```
+
+### 7.7 Monitoring and Metrics
+
+The networking layer provides comprehensive metrics:
+
+```go
+// From pkg/rpc/metrics.go
+type Metrics struct {
+    // Connection metrics
+    ConnectionsActive   *metric.Gauge
+    ConnectionsRefused  *metric.Counter
+    ConnectionsCreated  *metric.Counter
+    
+    // RPC metrics
+    RPCsSent            *metric.Counter
+    RPCsReceived        *metric.Counter
+    RPCErrors           *metric.Counter
+    
+    // Latency histograms
+    RPCLatency          metric.IHistogram
+    ConnectionLatency   metric.IHistogram
+    
+    // Circuit breaker metrics
+    CircuitBreakerTrips *metric.Counter
+}
+```
+
+### 7.8 Trade-offs in Networking Design
+
+The networking layer makes several important trade-offs:
+
+#### 7.8.1 Connection Persistence vs. Resource Usage
+
+- **Persistent Connections**: Reduces latency but consumes resources
+- **Connection Pooling**: Balances resource usage with performance
+
+#### 7.8.2 Security vs. Performance
+
+- **TLS Encryption**: Provides security but adds CPU overhead
+- **Compression**: Reduces bandwidth but increases CPU usage
+
+#### 7.8.3 Reliability vs. Complexity
+
+- **Circuit Breakers**: Prevent cascading failures but add complexity
+- **Health Checking**: Detects failures quickly but generates traffic
+
+The networking and communication layer provides the foundation for CockroachDB's distributed architecture. Through careful implementation of proven networking patterns and continuous optimization, the system achieves reliable, secure, and efficient communication across the cluster.
 
 ## 8. Advanced Features
 
