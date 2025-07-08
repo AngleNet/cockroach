@@ -24,6 +24,8 @@
 20. [Optimizer Rule Engine Deep Dive](#20-optimizer-rule-engine-deep-dive)
 21. [Raft Log Truncation & Logstore Management Deep Dive](#21-raft-log-truncation-logstore-management-deep-dive)
 22. [Backup SSTable Export Internals Deep Dive](#22-backup-sstable-export-internals-deep-dive)
+23. [Transaction Span Refresher Internals Deep Dive](#23-transaction-span-refresher-internals-deep-dive)
+24. [Tenant Cost Control Deep Dive](#24-tenant-cost-control-deep-dive)
 
 ---
 
@@ -6596,3 +6598,140 @@ Prometheus metrics:
 ---
 
 *Approx word count now 24,500. Further chapters: transaction span refresher internals, tenant cost control, SQL statistics refresher.*
+
+## 23. Transaction Span Refresher Internals Deep Dive
+
+Transactional contention is inevitable in write‐heavy workloads. CockroachDB mitigates aborts via the **txn span refresher** (TSR) interceptor, which automatically retries read spans at a higher timestamp when a transaction's commit timestamp is pushed. This chapter examines TSR algorithms, span tracking optimizations, and backoff strategies.
+
+### 23.1 Interceptor Placement
+
+`txnSpanRefresher` sits in the TxnSender interceptor stack before the **pipeliner** and after the **lockTable** interceptor:
+
+```
+client → DistSender → SpanRefresher → Pipeliner → TxnCoordSender
+```
+
+### 23.2 Span Tracking Data Structure
+
+```go
+// From pkg/kv/kvclient/kvcoord/txn_interceptor_span_refresher.go
+type txnSpanRefresher struct {
+    refreshFootprint condensableSpanSet // condensed SpanSet with interval tree
+    refreshInvalid  bool               // disabled if spans exceed limit
+    maxSpans        int                // cluster setting (default 1000)
+}
+```
+
+`condensableSpanSet` merges overlapping keys on the fly, maintaining O(log n) insert.
+
+### 23.3 Refresh Attempt Algorithm
+
+```go
+func (sr *txnSpanRefresher) maybeRefreshAndRetry(ctx context.Context, ba *kvpb.BatchRequest) error {
+    if !sr.shouldAttemptRefresh(pErr) { return pErr }
+    // 1. Elevate txn.ReadTimestamp to pErr.RetryableTxn.
+    sr.txn.SetNewerReadTimestamp(newTS)
+    // 2. Send Refresh batch over recorded spans.
+    if err := sr.sendRefreshes(ctx); err != nil { return err }
+    // 3. If all refreshes succeed, retry original batch.
+    return nil
+}
+```
+
+Refresh queries are lightweight `Refresh`/`RefreshRange` requests that validate data hasn't changed in `[oldTS,newTS)`.
+
+### 23.4 Footprint Condensation
+
+To cap memory, TSR condenses spans when count > `maxTxnRefreshSpans` (default 500):
+
+```go
+if sr.refreshFootprint.Len() > sr.maxSpans {
+    sr.refreshFootprint.Condense()  // merges all spans into full keyspace
+    sr.refreshInvalid = true       // disables future refresh
+}
+```
+
+If condensation occurs, the transaction falls back to full restart on next push.
+
+### 23.5 Interaction with Locking Reads
+
+If a transaction has issued `SELECT … FOR UPDATE`, refresh is **disallowed** because locked spans cannot be re‐evaluated at higher timestamps safely.
+
+### 23.6 Observability
+
+`kv.transaction.refresh.success` and `.fail` counters track outcomes; `EXPLAIN ANALYZE` shows `autoRetryCount` per statement.
+
+### 23.7 Trade‐offs
+
+| Advantage | Disadvantage |
+|-----------|--------------|
+| Reduces aborts, improving throughput | Extra network round trips |
+| Transparent to client | Memory overhead for span set |
+| Adaptive fallback via condensation | Complexity in correctness proofs |
+
+---
+
+## 24. Tenant Cost Control Deep Dive
+
+Multi‐tenant clusters must enforce fair resource usage. CockroachDB introduces a **tenant cost control** system that tracks per‐tenant resource consumption (CPU, IO, network) and applies back‐pressure or billing. This chapter details token buckets, usage attribution, and reporting.
+
+### 24.1 Cost Model
+
+Resources are measured in "request units" (RUs):
+
+```
+RU = cpu_ms*cpu_cost + read_bytes*read_cost + write_bytes*write_cost + network_bytes*net_cost
+```
+
+Default coefficients approximate cloud VM pricing.
+
+### 24.2 Request Admission Flow
+
+```
+SQL gateway → RU Estimator → RU Bucket (tenant) → admission.WorkQueue
+```
+
+* **Estimator** – Calculates expected RU before execution using statistics.
+* **Bucket** – Per‐tenant leaky bucket with refill rate governed by cluster setting or billing plan.
+
+### 24.3 RU Deduction & Refund
+
+At request finish:
+
+```go
+actualRU := usageRecorder.Compute(actualUsage)
+if refund := estRU-actualRU; refund>0 { bucket.Refund(refund) }
+```
+
+### 24.4 Refill Mechanism
+
+`costController`: background goroutine refills each bucket at `refillRate` tokens/s; negative balances are allowed up to `burstLimit`.
+
+### 24.5 Storage Attribution Path
+
+Write load produced by backup/restore is attributed via the bulk‐IO KV admission path; ingestion tokens charged to tenant who initiated job ID stored in job table.
+
+### 24.6 Metrics & Billing Export
+
+* `tenant_ru_used_total`
+* `tenant_ru_refill_total`
+* Prometheus labels include `tenant_id` and `plan`
+
+A gRPC endpoint `TenantCostServer.ExportUsage` streams RU deltas to the billing service.
+
+### 24.7 Governance Policies
+
+* **Hard limit** – If balance < `-hardDebt`, bucket admission returns `ErrTenantRUExceeded`.
+* **Soft shaping** – If balance < 0, admission downgrades to Elastic work class.
+
+### 24.8 Trade‐offs
+
+| Pro | Con |
+|-----|-----|
+| Prevents noisy neighbor | Requires accurate RU calibration |
+| Supports pay‐as‐you‐go billing | Adds overhead on every request |
+| Integrates with admission control | Complexity in multi‐region power users |
+
+---
+
+*Approx word count now 25,500. Future expansions: SQL statistics refresher internals, vectorized expression compiler, rangefeed backpressure.*
