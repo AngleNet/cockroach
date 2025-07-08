@@ -56,11 +56,11 @@
   - Processor scheduling
 
 ### Phase 6: Networking and Communication
-- [ ] 6.1 RPC Framework (3,000 words)
+- [x] 6.1 RPC Framework (3,000 words)
   - gRPC integration
   - Connection management
   - Flow control
-- [ ] 6.2 Gossip Protocol (3,000 words)
+- [x] 6.2 Gossip Protocol (3,000 words)
   - Implementation details
   - Information dissemination
   - Failure detection

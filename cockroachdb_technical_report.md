@@ -3738,101 +3738,749 @@ The networking and communication layer provides the foundation for CockroachDB's
 
 ## 8. Advanced Features
 
-### 8.1 Transactional DDL
+### 8.1 Change Data Capture (CDC)
 
-CockroachDB supports online schema changes through transactional DDL:
+CockroachDB's Change Data Capture (CDC) feature enables real-time streaming of data changes to external systems, supporting use cases like real-time analytics, data integration, and event-driven architectures.
+
+#### 8.1.1 CDC Architecture
+
+The CDC system is built on top of CockroachDB's rangefeed mechanism:
 
 ```go
-// From pkg/sql/ddl.go
-func (s *SchemaChanger) Execute(
-    ctx context.Context,
-    txn *kv.Txn,
-    statements []string,
-    options SchemaChangerOptions,
-) error {
-    // Execute statements in a transaction
+// From pkg/ccl/changefeedccl/changefeed.go
+type changefeed struct {
+    id       changefeedbase.ID
+    details  jobspb.ChangefeedDetails
+    
+    // Target specifications
+    targets  []changefeedbase.Target
+    
+    // Sink for emitting changes
+    sink     Sink
+    
+    // Progress tracking
+    frontier *spanFrontier
+    
+    // Metrics
+    metrics  *Metrics
+}
+
+func (cf *changefeed) run(ctx context.Context) error {
+    // Initialize rangefeed for each target span
+    for _, target := range cf.targets {
+        spans := cf.getSpansForTarget(target)
+        
+        for _, span := range spans {
+            if err := cf.startRangefeed(ctx, span); err != nil {
+                return err
+            }
+        }
+    }
+    
+    // Process events until context cancellation
+    return cf.processEvents(ctx)
 }
 ```
 
-### 8.2 Secondary Indexes
+#### 8.1.2 Event Processing
 
-CockroachDB supports secondary indexes on tables:
+CDC processes events from the rangefeed and transforms them for emission:
 
 ```go
-// From pkg/sql/index.go
-func (s *SchemaChanger) AddIndex(
+// From pkg/ccl/changefeedccl/event_processing.go
+type eventProcessor struct {
+    encoder Encoder
+    sink    Sink
+    
+    // Deduplication
+    seenKeys map[string]hlc.Timestamp
+    
+    // Buffering
+    buffer   *eventBuffer
+}
+
+func (ep *eventProcessor) processEvent(
     ctx context.Context,
-    txn *kv.Txn,
-    tableID descpb.ID,
-    index catalog.Index,
-    columns []catalog.Column,
-    opts index.IndexDescriptor,
+    ev *kvpb.RangeFeedEvent,
 ) error {
-    // Add index to table descriptor
+    switch {
+    case ev.Val != nil:
+        // Process value update
+        return ep.processValue(ctx, ev.Val)
+        
+    case ev.DeleteRange != nil:
+        // Process range deletion
+        return ep.processDeleteRange(ctx, ev.DeleteRange)
+        
+    case ev.Checkpoint != nil:
+        // Update progress frontier
+        return ep.processCheckpoint(ctx, ev.Checkpoint)
+    }
+    
+    return nil
+}
+
+func (ep *eventProcessor) processValue(
+    ctx context.Context,
+    val *kvpb.RangeFeedValue,
+) error {
+    // Decode the row
+    row, err := ep.decodeRow(val.Key, val.Value)
+    if err != nil {
+        return err
+    }
+    
+    // Check for duplicates
+    if ts, ok := ep.seenKeys[string(val.Key)]; ok && ts.Equal(val.Value.Timestamp) {
+        return nil // Skip duplicate
+    }
+    
+    // Encode for output
+    encoded, err := ep.encoder.Encode(row, val.Value.Timestamp)
+    if err != nil {
+        return err
+    }
+    
+    // Buffer or emit
+    return ep.buffer.Add(encoded)
 }
 ```
 
-### 8.3 Foreign Keys
+#### 8.1.3 Sink Implementations
 
-CockroachDB supports foreign keys on tables:
+CockroachDB supports multiple sink types for CDC output:
 
 ```go
-// From pkg/sql/foreign_key.go
-func (s *SchemaChanger) AddForeignKey(
+// From pkg/ccl/changefeedccl/sink.go
+type Sink interface {
+    EmitRow(ctx context.Context, topic string, key, value []byte) error
+    EmitResolvedTimestamp(ctx context.Context, ts hlc.Timestamp) error
+    Flush(ctx context.Context) error
+    Close() error
+}
+
+// Kafka sink implementation
+type kafkaSink struct {
+    producer sarama.AsyncProducer
+    
+    // Configuration
+    topic    string
+    config   *sarama.Config
+    
+    // Metrics
+    metrics  *Metrics
+}
+
+func (s *kafkaSink) EmitRow(
     ctx context.Context,
-    txn *kv.Txn,
-    tableID descpb.ID,
-    fk catalog.ForeignKey,
-    opts foreignkey.ForeignKeyDescriptor,
+    topic string,
+    key, value []byte,
 ) error {
-    // Add foreign key to table descriptor
+    msg := &sarama.ProducerMessage{
+        Topic: topic,
+        Key:   sarama.ByteEncoder(key),
+        Value: sarama.ByteEncoder(value),
+    }
+    
+    select {
+    case s.producer.Input() <- msg:
+        s.metrics.EmittedMessages.Inc(1)
+        return nil
+        
+    case <-ctx.Done():
+        return ctx.Err()
+    }
 }
 ```
 
-### 8.4 Inter-Transaction Conflict Detection
+### 8.2 Online Schema Changes
 
-CockroachDB implements inter-transaction conflict detection:
+CockroachDB implements online schema changes that don't block concurrent DML operations:
+
+#### 8.2.1 Schema Change Architecture
 
 ```go
-// From pkg/sql/concurrency/lock_table.go
-func (g *lockTableGuardImpl) CheckLocks() (bool, error) {
+// From pkg/sql/schemachanger/schemachanger.go
+type SchemaChanger struct {
+    execCfg      *ExecutorConfig
+    job          *jobs.Job
+    
+    // Schema change details
+    tableID      descpb.ID
+    mutationID   descpb.MutationID
+    
+    // Progress tracking
+    fractionCompleted float32
+}
+
+func (sc *SchemaChanger) exec(ctx context.Context) error {
+    // Execute schema change in stages
     for {
-        state := g.mu.state
-        switch state.kind {
-        case waitFor:
-            // Wait for conflicting transaction
-            return false, g.waitForConflict(state)
+        // Get current table descriptor
+        desc, err := sc.getTableDescriptor(ctx)
+        if err != nil {
+            return err
+        }
+        
+        // Find next mutation
+        mutation := desc.GetMutationByID(sc.mutationID)
+        if mutation == nil {
+            return nil // Complete
+        }
+        
+        // Execute based on state
+        switch mutation.State {
+        case descpb.DescriptorMutation_DELETE_ONLY:
+            return sc.runStateMachinePhase(ctx, deleteOnly)
             
-        case waitElsewhere:
-            // Push conflicting transaction
-            return false, g.pushConflictingTxn(state)
+        case descpb.DescriptorMutation_WRITE_ONLY:
+            return sc.runStateMachinePhase(ctx, writeOnly)
             
-        case doneWaiting:
-            // No conflicts - proceed
-            return true, nil
+        case descpb.DescriptorMutation_DELETE_AND_WRITE_ONLY:
+            return sc.runStateMachinePhase(ctx, deleteAndWriteOnly)
+            
+        case descpb.DescriptorMutation_MERGING:
+            return sc.runStateMachinePhase(ctx, merging)
         }
     }
 }
 ```
 
-### 8.5 Transactional MVCC
+#### 8.2.2 Backfill Process
 
-CockroachDB implements transactional MVCC:
+Schema changes requiring data backfill are executed incrementally:
 
 ```go
-// From pkg/sql/mvcc.go
-func (txn *Txn) Get(
-    ctx context.Context, key interface{},
-) (KeyValue, error) {
-    // Get value from MVCC
+// From pkg/sql/backfill/backfill.go
+type IndexBackfiller struct {
+    fetcher     row.Fetcher
+    writer      row.Writer
+    
+    // Backfill configuration
+    chunkSize   int64
+    readAsOf    hlc.Timestamp
+    
+    // Progress tracking
+    resumeSpan  roachpb.Span
 }
 
-func (txn *Txn) Put(
-    ctx context.Context, key, value interface{},
+func (ib *IndexBackfiller) Run(
+    ctx context.Context,
+    startKey, endKey roachpb.Key,
 ) error {
-    // Put value into MVCC
+    for {
+        // Process a chunk
+        resumeKey, err := ib.processChunk(ctx, startKey, endKey)
+        if err != nil {
+            return err
+        }
+        
+        // Check if complete
+        if resumeKey == nil {
+            return nil
+        }
+        
+        // Update progress
+        startKey = resumeKey
+        
+        // Check for cancellation
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+        }
+    }
+}
+
+func (ib *IndexBackfiller) processChunk(
+    ctx context.Context,
+    startKey, endKey roachpb.Key,
+) (roachpb.Key, error) {
+    // Scan chunk of rows
+    err := ib.fetcher.StartScan(
+        ctx, 
+        roachpb.Span{Key: startKey, EndKey: endKey},
+        ib.chunkSize,
+        ib.readAsOf,
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    var lastKey roachpb.Key
+    for {
+        row, err := ib.fetcher.NextRow(ctx)
+        if err != nil {
+            return nil, err
+        }
+        if row == nil {
+            break
+        }
+        
+        // Write index entries
+        if err := ib.writer.WriteIndex(ctx, row); err != nil {
+            return nil, err
+        }
+        
+        lastKey = row.Key
+    }
+    
+    return lastKey, nil
 }
 ```
+
+### 8.3 Multi-Region Capabilities
+
+CockroachDB provides sophisticated multi-region support for global deployments:
+
+#### 8.3.1 Region Configuration
+
+```go
+// From pkg/sql/region_util.go
+type RegionConfig struct {
+    // Primary region for the database
+    PrimaryRegion catpb.RegionName
+    
+    // All regions where database is deployed
+    Regions []catpb.RegionName
+    
+    // Survival goals
+    SurvivalGoal descpb.SurvivalGoal
+    
+    // Data domiciling
+    DataPlacement descpb.DataPlacement
+}
+
+func (rc *RegionConfig) Validate() error {
+    // Verify primary region is in region list
+    if !rc.IsValidRegion(rc.PrimaryRegion) {
+        return errors.Errorf("primary region %s not in region list", rc.PrimaryRegion)
+    }
+    
+    // Check survival goal compatibility
+    switch rc.SurvivalGoal {
+    case descpb.SurvivalGoal_ZONE_FAILURE:
+        // Requires at least 3 AZs in region
+        if rc.numZonesInRegion(rc.PrimaryRegion) < 3 {
+            return errors.Errorf("ZONE_FAILURE requires 3+ zones")
+        }
+        
+    case descpb.SurvivalGoal_REGION_FAILURE:
+        // Requires at least 3 regions
+        if len(rc.Regions) < 3 {
+            return errors.Errorf("REGION_FAILURE requires 3+ regions")
+        }
+    }
+    
+    return nil
+}
+```
+
+#### 8.3.2 Locality-Aware Routing
+
+```go
+// From pkg/sql/physicalplan/replicaoracle/oracle.go
+type Oracle interface {
+    ChoosePreferredReplica(
+        ctx context.Context,
+        txn *kv.Txn,
+        desc *roachpb.RangeDescriptor,
+        leaseholder *roachpb.ReplicaDescriptor,
+        ctPolicy roachpb.ClosedTimestampPolicy,
+        queryState QueryState,
+    ) (*roachpb.ReplicaDescriptor, error)
+}
+
+type localityOracle struct {
+    nodeDescs     NodeDescStore
+    latencyFunc   LatencyFunc
+}
+
+func (o *localityOracle) ChoosePreferredReplica(
+    ctx context.Context,
+    txn *kv.Txn,
+    desc *roachpb.RangeDescriptor,
+    leaseholder *roachpb.ReplicaDescriptor,
+    ctPolicy roachpb.ClosedTimestampPolicy,
+    queryState QueryState,
+) (*roachpb.ReplicaDescriptor, error) {
+    // For follower reads, find closest replica
+    if queryState.IsFollowerRead {
+        return o.closestReplica(desc, txn.GetReadTimestamp())
+    }
+    
+    // Default to leaseholder
+    return leaseholder, nil
+}
+
+func (o *localityOracle) closestReplica(
+    desc *roachpb.RangeDescriptor,
+    readTS hlc.Timestamp,
+) (*roachpb.ReplicaDescriptor, error) {
+    var closest *roachpb.ReplicaDescriptor
+    minLatency := time.Duration(math.MaxInt64)
+    
+    for _, replica := range desc.Replicas().Descriptors() {
+        // Check if replica is caught up
+        if !o.isReplicaCaughtUp(replica, readTS) {
+            continue
+        }
+        
+        // Calculate latency
+        latency := o.latencyFunc(replica.NodeID)
+        if latency < minLatency {
+            minLatency = latency
+            closest = &replica
+        }
+    }
+    
+    return closest, nil
+}
+```
+
+### 8.4 Backup and Restore
+
+CockroachDB implements distributed backup and restore with incremental capabilities:
+
+#### 8.4.1 Backup Architecture
+
+```go
+// From pkg/ccl/backupccl/backup.go
+type backupResumer struct {
+    job      *jobs.Job
+    settings *cluster.Settings
+    
+    // Backup specification
+    spec     backuppb.BackupDetails
+    
+    // Progress tracking
+    progCh   chan backupProgress
+}
+
+func (b *backupResumer) Resume(ctx context.Context) error {
+    // Initialize backup metadata
+    meta := &backuppb.BackupMetadata{
+        StartTime:   b.spec.StartTime,
+        EndTime:     hlc.Timestamp{},
+        Descriptors: []descpb.Descriptor{},
+    }
+    
+    // Export data files
+    exportSpecs := b.makeExportSpecs()
+    
+    // Run distributed export
+    if err := b.runDistributedExport(ctx, exportSpecs); err != nil {
+        return err
+    }
+    
+    // Write backup manifest
+    return b.writeManifest(ctx, meta)
+}
+
+func (b *backupResumer) runDistributedExport(
+    ctx context.Context,
+    specs []execinfrapb.ExportSpec,
+) error {
+    // Create DistSQL plan
+    planCtx := b.job.PlanCtx()
+    p := planCtx.NewPhysicalPlan()
+    
+    // Add export processors
+    for _, spec := range specs {
+        proc := execinfrapb.ProcessorSpec{
+            Core: execinfrapb.ProcessorCoreUnion{
+                Export: &spec,
+            },
+        }
+        p.AddProcessor(proc)
+    }
+    
+    // Execute plan
+    return b.runPlan(ctx, p)
+}
+```
+
+#### 8.4.2 Incremental Backups
+
+```go
+// From pkg/ccl/backupccl/incremental.go
+func planIncrementalBackup(
+    ctx context.Context,
+    prevBackups []backuppb.BackupMetadata,
+    tables []catalog.TableDescriptor,
+    startTime hlc.Timestamp,
+) ([]execinfrapb.ExportSpec, error) {
+    var specs []execinfrapb.ExportSpec
+    
+    for _, table := range tables {
+        // Find spans that need backup
+        spans := table.AllIndexSpans()
+        
+        for _, span := range spans {
+            // Determine incremental time bounds
+            var prevEndTime hlc.Timestamp
+            for _, prev := range prevBackups {
+                if prev.Covers(span) && prev.EndTime.After(prevEndTime) {
+                    prevEndTime = prev.EndTime
+                }
+            }
+            
+            // Create export spec for incremental data
+            spec := execinfrapb.ExportSpec{
+                Span:        span,
+                StartTime:   prevEndTime,
+                MVCCFilter:  execinfrapb.MVCCFilter_All,
+                OmitChecksum: false,
+            }
+            
+            specs = append(specs, spec)
+        }
+    }
+    
+    return specs, nil
+}
+```
+
+### 8.5 Encryption at Rest
+
+CockroachDB supports encryption at rest for data security:
+
+#### 8.5.1 Encryption Architecture
+
+```go
+// From pkg/ccl/storageccl/encryption/manager.go
+type Manager struct {
+    activeKey   *enginepb.SecretKey
+    oldKeys     map[string]*enginepb.SecretKey
+    
+    // Key rotation
+    rotationMu  struct {
+        sync.Mutex
+        inProgress bool
+        stats      RotationStats
+    }
+}
+
+func (m *Manager) Encrypt(plaintext []byte) ([]byte, error) {
+    // Generate nonce
+    nonce := make([]byte, nonceSize)
+    if _, err := rand.Read(nonce); err != nil {
+        return nil, err
+    }
+    
+    // Encrypt with active key
+    ciphertext := m.activeKey.Seal(nil, nonce, plaintext, nil)
+    
+    // Prepend key ID and nonce
+    result := make([]byte, 0, keyIDSize+nonceSize+len(ciphertext))
+    result = append(result, m.activeKey.ID...)
+    result = append(result, nonce...)
+    result = append(result, ciphertext...)
+    
+    return result, nil
+}
+
+func (m *Manager) Decrypt(ciphertext []byte) ([]byte, error) {
+    // Extract key ID
+    if len(ciphertext) < keyIDSize+nonceSize {
+        return nil, errors.New("invalid ciphertext")
+    }
+    
+    keyID := ciphertext[:keyIDSize]
+    nonce := ciphertext[keyIDSize:keyIDSize+nonceSize]
+    encrypted := ciphertext[keyIDSize+nonceSize:]
+    
+    // Find key
+    key := m.findKey(keyID)
+    if key == nil {
+        return nil, errors.Errorf("unknown key ID: %x", keyID)
+    }
+    
+    // Decrypt
+    return key.Open(nil, nonce, encrypted, nil)
+}
+```
+
+### 8.6 Query Plan Management
+
+CockroachDB provides tools for query plan investigation and management:
+
+#### 8.6.1 Plan Cache
+
+```go
+// From pkg/sql/plan_cache.go
+type PlanCache struct {
+    mu struct {
+        sync.RWMutex
+        
+        // LRU cache of prepared plans
+        cache    *cache.UnorderedCache
+        
+        // Memory accounting
+        memAcc   mon.BoundAccount
+    }
+}
+
+func (pc *PlanCache) Get(
+    ctx context.Context,
+    key PlanCacheKey,
+) (CachedPlan, bool) {
+    pc.mu.RLock()
+    defer pc.mu.RUnlock()
+    
+    entry, ok := pc.mu.cache.Get(key)
+    if !ok {
+        return CachedPlan{}, false
+    }
+    
+    cached := entry.(CachedPlan)
+    
+    // Validate plan is still valid
+    if err := cached.Validate(ctx); err != nil {
+        // Plan invalidated
+        pc.mu.cache.Del(key)
+        return CachedPlan{}, false
+    }
+    
+    return cached, true
+}
+```
+
+#### 8.6.2 Statistics Collection
+
+```go
+// From pkg/sql/stats/automatic_stats.go
+type Refresher struct {
+    st           *cluster.Settings
+    ex           sqlutil.InternalExecutor
+    cache        *TableStatisticsCache
+    
+    // Auto-refresh configuration
+    asOfTime     time.Duration
+    targetRows   int64
+}
+
+func (r *Refresher) maybeRefreshStats(
+    ctx context.Context,
+    tableID descpb.ID,
+) error {
+    // Check if stats are stale
+    stats, err := r.cache.GetTableStats(ctx, tableID)
+    if err != nil {
+        return err
+    }
+    
+    if !r.shouldRefresh(stats) {
+        return nil
+    }
+    
+    // Create statistics job
+    return r.createStatsJob(ctx, tableID)
+}
+
+func (r *Refresher) shouldRefresh(stats *TableStatistics) bool {
+    // Check staleness by time
+    if timeutil.Since(stats.LastUpdated) > r.asOfTime {
+        return true
+    }
+    
+    // Check staleness by row count change
+    rowsChanged := abs(stats.RowCount - stats.LastCollectedRows)
+    changeRatio := float64(rowsChanged) / float64(stats.RowCount)
+    
+    return changeRatio > staleRowThreshold
+}
+```
+
+### 8.7 Admission Control
+
+CockroachDB implements admission control to prevent overload:
+
+#### 8.7.1 Admission Queue
+
+```go
+// From pkg/util/admission/work_queue.go
+type WorkQueue struct {
+    mu struct {
+        sync.Mutex
+        
+        // Tenant queues
+        tenants map[roachpb.TenantID]*tenantQueue
+        
+        // Global limits
+        maxQueuedRequests int
+        currentQueued     int
+    }
+    
+    // Metrics
+    metrics *WorkQueueMetrics
+}
+
+func (q *WorkQueue) Admit(
+    ctx context.Context,
+    pri admissionpb.WorkPriority,
+    info WorkInfo,
+) error {
+    q.mu.Lock()
+    
+    // Check global limit
+    if q.mu.currentQueued >= q.mu.maxQueuedRequests {
+        q.mu.Unlock()
+        return errors.New("queue full")
+    }
+    
+    // Get tenant queue
+    tq := q.getTenantQueueLocked(info.TenantID)
+    
+    // Try immediate admission
+    if tq.tryAdmit(pri) {
+        q.mu.Unlock()
+        return nil
+    }
+    
+    // Queue the request
+    waiter := &waiter{
+        priority: pri,
+        ready:    make(chan struct{}),
+    }
+    tq.queue(waiter)
+    q.mu.currentQueued++
+    q.mu.Unlock()
+    
+    // Wait for admission
+    select {
+    case <-waiter.ready:
+        return nil
+    case <-ctx.Done():
+        q.cancel(waiter)
+        return ctx.Err()
+    }
+}
+```
+
+### 8.8 Trade-offs in Advanced Features
+
+Each advanced feature involves specific design trade-offs:
+
+#### 8.8.1 CDC Trade-offs
+
+- **Latency vs. Throughput**: Lower latency requires more frequent checkpoints
+- **Consistency vs. Performance**: Exactly-once delivery adds overhead
+- **Flexibility vs. Complexity**: Multiple sink types increase maintenance
+
+#### 8.8.2 Schema Change Trade-offs
+
+- **Availability vs. Speed**: Online changes are slower than offline
+- **Safety vs. Performance**: Multiple phases ensure correctness but add time
+- **Resource Usage vs. Impact**: Smaller chunks reduce impact but extend duration
+
+#### 8.8.3 Multi-Region Trade-offs
+
+- **Latency vs. Consistency**: Follower reads reduce latency but may be stale
+- **Availability vs. Cost**: Region failure survival requires more replicas
+- **Performance vs. Compliance**: Data domiciling may limit optimization
+
+These advanced features demonstrate CockroachDB's evolution from a distributed database to a comprehensive data platform, providing enterprise-grade capabilities while maintaining operational simplicity.
 
 ## 9. Performance and Monitoring
 
