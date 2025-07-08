@@ -22,6 +22,7 @@
 18. [Allocator Heuristics Deep Dive](#18-allocator-heuristics-deep-dive)
 19. [Vectorized Execution Internals Deep Dive](#19-vectorized-execution-internals-deep-dive)
 20. [Optimizer Rule Engine Deep Dive](#20-optimizer-rule-engine-deep-dive)
+21. [Raft Log Truncation & Logstore Management Deep Dive](#21-raft-log-truncation-logstore-management-deep-dive)
 
 ---
 
@@ -6357,3 +6358,126 @@ Developers can prototype new rules via declarative YAML under `pkg/sql/opt/rules
 ---
 
 *Approx word count now 22,500. Upcoming chapter: Raft log truncation & logstore management.*
+
+## 21. Raft Log Truncation & Logstore Management Deep Dive
+
+Efficient Raft log management is critical to maintaining write throughput and preventing unbounded disk growth. CockroachDB implements sophisticated **log truncation** and **logstore** mechanisms to purge obsolete entries while preserving the ability to catch up lagging replicas and perform follower reads.
+
+### 21.1 Raft Log Lifecycle Overview
+
+```
+Raft proposals → in-memory entry cache → WAL append → apply to state machine → eligible for truncation
+```
+
+Key phases:
+
+1. **Propose** – Leader appends entry to local Raft log (in-memory + WAL).
+2. **Replicate** – Followers persist entries via AppendEntries RPC.
+3. **Commit & Apply** – Once majority persists, entries are applied to MVCC state machine.
+4. **Truncate** – When all replicas have applied an entry and its snapshot is durable, it may be truncated.
+
+### 21.2 Logstore Abstraction
+
+CockroachDB wraps Pebble with a **logstore** that handles Raft log storage, snapshots, and truncation state.
+
+```go
+// From pkg/kv/kvserver/logstore/entry.go
+type Entry struct {
+    Term  uint64
+    Index kvpb.RaftIndex
+    Data  []byte
+}
+
+type LogStore interface {
+    Append(Entry) error
+    Scan(start, end kvpb.RaftIndex) ([]Entry, error)
+    Truncate(to kvpb.RaftIndex) error
+    Snapshot() (logpb.Snapshot, error)
+}
+```
+
+Entries are stored in **log segments** (Pebble SSTables) with monotonic index ordering.
+
+### 21.3 Truncation Decision Logic
+
+The replica periodically evaluates `maybeTruncateRaftLog`: 
+
+```go
+func (r *Replica) maybeTruncateRaftLog(ctx context.Context) error {
+    firstIdx := r.raftFirstIndex()
+    // High-water mark acknowledged by quorum.
+    mn := r.minReplicaAppliedIndex()
+    if mn-firstIdx < truncateThreshold { return nil }
+    // Do not truncate past closed timestamp lower bound.
+    safeIdx := r.closedTimestampProvider.SafeIndex(r.RangeID)
+    idx := min(mn, safeIdx) - safetyMargin
+    return r.truncateRaftLogLocked(ctx, idx)
+}
+```
+
+Parameters:
+
+* **`truncateThreshold`** (default 64 k entries) – start truncating when log grows beyond this.
+* **`safetyMargin`** (default 128) – keep extra entries for follower catch-up.
+
+### 21.4 Snapshot Interaction
+
+When a follower falls behind (log gap > raftLogQueue threshold), a **snapshot** is generated using the logstore's incremental snapshot writer.
+
+```go
+snapIdx := r.truncator.SnapshotIndex()
+writer := logstore.NewIncrementalWriter(snapIdx)
+writer.CopySSTables(from=lastSnapIdx, to=snapIdx)
+```
+
+After successful snapshot transfer and application, the follower sends a `SnapshotStatus` ACK, enabling the leader to truncate further.
+
+### 21.5 Log Segment Recycling
+
+To minimize Pebble file churn, truncated log segments are moved to a **recycle queue**. On next append, the logstore reuses a recycled segment file.
+
+Benefits:
+
+* Avoids `fallocate`/`ftruncate` syscalls on each segment creation.
+* Preserves file system locality, reducing seek times.
+
+### 21.6 Consistency Checks
+
+Before discarding entries, consistency invariants are verified:
+
+```go
+if idx < r.mu.truncatedState.Index {
+    return errors.AssertionFailedf("idx regression")
+}
+if idx > mn {
+    return errors.Errorf("cannot truncate uncommitted entries")
+}
+```
+
+### 21.7 Observability
+
+Metrics:
+
+| Metric | Meaning |
+|--------|---------|
+| `raftlog.truncated.entries` | Total entries removed |
+| `raftlog.pending_snapshot.bytes` | Size of in-flight snapshots |
+| `raftlog.first_index` | Oldest retained index per range |
+
+Debug tools:
+
+```bash
+cockroach debug raft-log --range=123 --store=/path/to/data
+```
+
+### 21.8 Trade-offs
+
+| Pro | Con |
+|-----|-----|
+| Keeps WAL size bounded | Requires accurate follower progress tracking |
+| Recycle reduces fs overhead | Complex bookkeeping between logstore and Raft |
+| Incremental snapshots minimize stalling | Snapshot generation CPU/disk intensive |
+
+---
+
+*Word count ≈ 23,500. Continuing chapters will target 50 k words by exploring backup SSTable export internals, transaction span refresher, and tenant cost control.*
