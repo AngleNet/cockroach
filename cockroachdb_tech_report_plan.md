@@ -15,11 +15,11 @@
   - Design patterns and trade-offs
 
 ### Phase 2: Storage Layer Analysis
-- [ ] 2.1 Storage Engine Implementation (4,000 words)
+- [x] 2.1 Storage Engine Implementation (4,000 words)
   - Pebble integration
   - MVCC implementation
   - Key-value storage format
-- [ ] 2.2 Storage Optimizations and Trade-offs (3,000 words)
+- [x] 2.2 Storage Optimizations and Trade-offs (3,000 words)
   - Write amplification
   - Read performance
   - Compaction strategies

@@ -1310,3 +1310,705 @@ The storage layer continues to evolve with several optimizations in development:
 These optimizations maintain backward compatibility while improving performance and reducing operational costs.
 
 The storage layer's sophisticated design enables CockroachDB to provide strong consistency guarantees while maintaining high performance across diverse workloads. The careful balance of trade-offs and continuous optimization ensures the system can scale from single-node deployments to massive distributed clusters.
+
+## 4. Distributed Systems Core
+
+### 4.1 Range Management
+
+CockroachDB's distributed architecture is built on the concept of ranges - contiguous spans of the keyspace that serve as the unit of data distribution and replication. The range management system is responsible for maintaining data availability, load balancing, and efficient resource utilization across the cluster.
+
+#### 4.1.1 Range Structure and Metadata
+
+Each range in CockroachDB is a self-contained unit with its own metadata and state machine:
+
+```go
+// From pkg/kv/kvserver/replica.go
+type Replica struct {
+    RangeID   roachpb.RangeID
+    store     *Store
+    
+    mu struct {
+        syncutil.RWMutex
+        
+        // Range descriptor defines the key span and replica set
+        state storagepb.ReplicaState
+        
+        // Raft state machine
+        raftGroup *raft.RawNode
+        
+        // Lease information
+        lease roachpb.Lease
+        
+        // Proposal buffer for batching
+        proposalBuf propBuf
+        
+        // Timestamp cache for read consistency
+        tsCache timestampCache
+    }
+    
+    // Metrics and monitoring
+    rangefeedMu struct {
+        syncutil.RWMutex
+        proc *rangefeed.Processor
+    }
+}
+```
+
+The range descriptor is the authoritative source of information about a range:
+
+```go
+// From pkg/roachpb/metadata.proto
+type RangeDescriptor struct {
+    RangeID       RangeID
+    StartKey      RKey        // Inclusive
+    EndKey        RKey        // Exclusive
+    
+    // Replica set configuration
+    InternalReplicas []ReplicaDescriptor
+    
+    // Generation counter for detecting splits/merges
+    Generation RangeGeneration
+    
+    // Sticky bit for system ranges
+    StickyBit hlc.Timestamp
+}
+```
+
+#### 4.1.2 Range Splitting
+
+Ranges split automatically when they exceed size thresholds to maintain manageable units:
+
+```go
+// From pkg/kv/kvserver/split_queue.go
+func (sq *splitQueue) shouldQueue(
+    ctx context.Context, now hlc.ClockTimestamp, r *Replica, _ spanconfig.StoreReader,
+) (shouldQueue bool, priority float64) {
+    // Check size threshold (default 512MB)
+    if r.GetMVCCStats().Total() > r.GetMaxBytes() {
+        return true, float64(r.GetMVCCStats().Total()) / float64(r.GetMaxBytes())
+    }
+    
+    // Check load-based splitting
+    if shouldSplitBasedOnLoad(ctx, r) {
+        return true, splitQueuePriority
+    }
+    
+    return false, 0
+}
+
+func (sq *splitQueue) process(
+    ctx context.Context, r *Replica, _ spanconfig.StoreReader,
+) (processed bool, err error) {
+    // Find optimal split point
+    splitKey := sq.findSplitKey(ctx, r)
+    if splitKey == nil {
+        return false, nil
+    }
+    
+    // Execute split transaction
+    return true, r.adminSplitWithDescriptor(ctx, splitKey)
+}
+```
+
+The split finding algorithm balances multiple considerations:
+
+```go
+// From pkg/kv/kvserver/split/finder.go
+type Finder struct {
+    samples      []sample
+    totalWeight  float64
+    
+    // Load tracking
+    loadSplitKey roachpb.Key
+}
+
+func (f *Finder) Key() roachpb.Key {
+    // Prefer load-based split points
+    if f.loadSplitKey != nil {
+        return f.loadSplitKey
+    }
+    
+    // Fall back to size-based split
+    return f.sizeSplitKey()
+}
+```
+
+#### 4.1.3 Range Merging
+
+Conversely, underutilized ranges can be merged to reduce overhead:
+
+```go
+// From pkg/kv/kvserver/merge_queue.go
+func (mq *mergeQueue) process(
+    ctx context.Context, r *Replica, _ spanconfig.StoreReader,
+) (processed bool, err error) {
+    // Check if range is small enough to merge
+    stats := r.GetMVCCStats()
+    if stats.Total() > mergeSizeThreshold {
+        return false, nil
+    }
+    
+    // Find merge candidate (left or right neighbor)
+    var mergeTarget *Replica
+    if leftRepl := mq.store.lookupPrecedingReplica(r.Desc().StartKey); leftRepl != nil {
+        if canMergeRanges(leftRepl, r) {
+            mergeTarget = leftRepl
+        }
+    }
+    
+    if mergeTarget != nil {
+        return true, r.adminMerge(ctx, mergeTarget)
+    }
+    return false, nil
+}
+```
+
+#### 4.1.4 Rebalancing Mechanisms
+
+The allocator continuously works to balance load across the cluster:
+
+```go
+// From pkg/kv/kvserver/allocator/allocator.go
+type Allocator struct {
+    storePool     *storepool.StorePool
+    nodeLatencyFn func(nodeID roachpb.NodeID) (time.Duration, bool)
+}
+
+func (a *Allocator) ComputeAction(
+    ctx context.Context,
+    conf roachpb.SpanConfig,
+    desc *roachpb.RangeDescriptor,
+) (AllocatorAction, float64) {
+    // Evaluate range health
+    have := len(desc.Replicas().Descriptors())
+    want := int(conf.NumReplicas)
+    
+    if have < want {
+        // Under-replicated
+        return AllocatorAddVoter, 1.0
+    } else if have > want {
+        // Over-replicated
+        return AllocatorRemoveVoter, 1.0
+    }
+    
+    // Check for better placement
+    if a.shouldRebalance(ctx, desc, conf) {
+        return AllocatorConsiderRebalance, 0.5
+    }
+    
+    return AllocatorNoop, 0
+}
+```
+
+The rebalancing decision considers multiple factors:
+
+```go
+// From pkg/kv/kvserver/allocator/allocator_scorer.go
+func rankedCandidates(
+    stores []roachpb.StoreDescriptor,
+    options scorerOptions,
+) candidateList {
+    var candidates candidateList
+    
+    for _, store := range stores {
+        score := balanceScore{
+            // Capacity utilization
+            capacityScore: capacityScore(store),
+            
+            // Range count balance
+            rangeScore: float64(store.RangeCount),
+            
+            // Load (QPS) balance
+            loadScore: store.QueriesPerSecond,
+            
+            // Locality preferences
+            localityScore: localityScore(store, options),
+        }
+        
+        candidates = append(candidates, candidate{
+            store: store,
+            score: score.combine(),
+        })
+    }
+    
+    sort.Sort(candidates)
+    return candidates
+}
+```
+
+### 4.2 Raft Consensus Implementation
+
+CockroachDB uses the Raft consensus algorithm to maintain consistency across range replicas. The implementation includes numerous optimizations for production use.
+
+#### 4.2.1 Raft Integration
+
+Each range maintains its own Raft group:
+
+```go
+// From pkg/kv/kvserver/replica_raft.go
+func (r *Replica) withRaftGroup(
+    f func(raftGroup *raft.RawNode) (unquiesceAndWakeLeader bool, _ error),
+) error {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    
+    // Initialize Raft group if needed
+    if r.mu.raftGroup == nil {
+        if err := r.initRaftGroupRLocked(); err != nil {
+            return err
+        }
+    }
+    
+    // Execute operation with Raft group
+    unquiesce, err := f(r.mu.raftGroup)
+    
+    if unquiesce {
+        r.unquiesceAndWakeLeaderLocked()
+    }
+    
+    return err
+}
+```
+
+#### 4.2.2 Leader Election
+
+Leader election follows the standard Raft protocol with CockroachDB-specific optimizations:
+
+```go
+// From pkg/kv/kvserver/replica_raft.go
+func shouldCampaignOnWake(
+    leaseStatus kvserverpb.LeaseStatus,
+    storeID roachpb.StoreID,
+    raftStatus raft.BasicStatus,
+    livenessMap livenesspb.IsLiveMap,
+    desc *roachpb.RangeDescriptor,
+    requiresExpirationLease bool,
+    now hlc.Timestamp,
+) bool {
+    // Avoid campaigns if we're draining
+    if leaseStatus.State == kvserverpb.LeaseState_UNUSABLE {
+        return false
+    }
+    
+    // Campaign if we're the leaseholder but not leader
+    if leaseStatus.OwnedBy(storeID) && raftStatus.RaftState != raft.StateLeader {
+        return true
+    }
+    
+    // Check if current leader is dead
+    if raftStatus.Lead != 0 {
+        leadReplica, ok := desc.GetReplicaDescriptorByID(roachpb.ReplicaID(raftStatus.Lead))
+        if ok && !livenessMap[leadReplica.NodeID].IsLive {
+            return true
+        }
+    }
+    
+    return false
+}
+```
+
+#### 4.2.3 Log Replication
+
+The Raft log replication is optimized for high throughput:
+
+```go
+// From pkg/kv/kvserver/replica_raft.go
+func (r *Replica) propose(
+    ctx context.Context, p *ProposalData, tok TrackedRequestToken,
+) (pErr *kvpb.Error) {
+    // Encode command with optimizations
+    data, err := raftlog.EncodeCommand(ctx, p.command, p.idKey,
+        raftlog.EncodeOptions{
+            RaftAdmissionMeta: p.raftAdmissionMeta,
+            EncodePriority:    true,
+        })
+    if err != nil {
+        return kvpb.NewError(err)
+    }
+    
+    // Insert into proposal buffer for batching
+    if err := r.mu.proposalBuf.Insert(ctx, p, tok.Move(ctx)); err != nil {
+        return kvpb.NewError(err)
+    }
+    
+    r.store.metrics.RaftCommandsProposed.Inc(1)
+    return nil
+}
+```
+
+#### 4.2.4 Performance Optimizations
+
+CockroachDB implements several Raft optimizations:
+
+1. **Coalesced Heartbeats**: Heartbeats are coalesced across ranges to reduce network traffic:
+
+```go
+// From pkg/kv/kvserver/replica_raft.go
+func (r *Replica) maybeCoalesceHeartbeat(
+    ctx context.Context,
+    msg raftpb.Message,
+    toReplica, fromReplica roachpb.ReplicaDescriptor,
+    quiesce bool,
+    lagging laggingReplicaSet,
+) bool {
+    // Check if we can coalesce this heartbeat
+    if !msg.IsHeartbeat() {
+        return false
+    }
+    
+    // Add to coalesced heartbeat message
+    r.store.coalescedMu.Lock()
+    defer r.store.coalescedMu.Unlock()
+    
+    r.store.coalescedMu.heartbeats[toReplica.NodeID] = append(
+        r.store.coalescedMu.heartbeats[toReplica.NodeID],
+        heartbeatInfo{
+            RangeID:    r.RangeID,
+            FromReplica: fromReplica,
+            ToReplica:   toReplica,
+            Quiesce:     quiesce,
+            Lagging:     lagging,
+        },
+    )
+    
+    return true
+}
+```
+
+2. **Quiescence**: Inactive ranges stop Raft traffic entirely:
+
+```go
+// From pkg/kv/kvserver/replica_raft_quiesce.go
+func (r *Replica) maybeQuiesceRaftMuLockedReplicaMuLocked(
+    ctx context.Context, now hlc.ClockTimestamp, livenessMap livenesspb.IsLiveMap,
+) bool {
+    // Check if range has been inactive
+    if r.mu.lastUpdateTimes.hasActivitySince(now, quiesceAfterTicks) {
+        return false
+    }
+    
+    // Verify all replicas are caught up
+    status := r.raftStatusRLocked()
+    for _, progress := range status.Progress {
+        if progress.State != tracker.StateReplicate {
+            return false
+        }
+        if progress.Match != r.mu.lastIndex {
+            return false
+        }
+    }
+    
+    // Quiesce the range
+    r.mu.quiescent = true
+    return true
+}
+```
+
+3. **Batched Proposals**: Multiple proposals are batched into single Raft commands:
+
+```go
+// From pkg/kv/kvserver/proposal_buffer.go
+type propBuf struct {
+    lifo     []*ProposalData
+    used     int
+    maxSize  int
+    
+    // Flushing state
+    flushIndex uint64
+    flushTimer *time.Timer
+}
+
+func (b *propBuf) Insert(ctx context.Context, p *ProposalData, tok TrackedRequestToken) error {
+    b.mu.Lock()
+    defer b.mu.Unlock()
+    
+    // Add to buffer
+    b.lifo[b.used] = p
+    b.used++
+    
+    // Flush if buffer is full or on timer
+    if b.used >= b.maxSize || b.shouldFlushLocked() {
+        return b.flushLocked(ctx)
+    }
+    
+    return nil
+}
+```
+
+### 4.3 Range Leases
+
+Range leases provide a performance optimization by allowing reads without going through Raft consensus:
+
+#### 4.3.1 Lease Types
+
+CockroachDB supports two types of leases:
+
+```go
+// From pkg/roachpb/data.proto
+type Lease struct {
+    Start         hlc.Timestamp
+    Expiration    hlc.Timestamp  // For expiration-based leases
+    Replica       ReplicaDescriptor
+    Epoch         int64          // For epoch-based leases
+    Sequence      LeaseSequence
+    
+    Type LeaseType // EXPIRATION or EPOCH
+}
+```
+
+Epoch-based leases are preferred as they don't require clock synchronization:
+
+```go
+// From pkg/kv/kvserver/replica_range_lease.go
+func (r *Replica) requestLeaseLocked(
+    ctx context.Context, status kvserverpb.LeaseStatus,
+) *kvpb.Error {
+    // Determine lease type
+    var lease roachpb.Lease
+    if r.shouldUseExpirationLeaseRLocked() {
+        // Expiration-based lease
+        lease = roachpb.Lease{
+            Start:      r.store.Clock().Now(),
+            Expiration: r.store.Clock().Now().Add(LeaseExpiration),
+            Replica:    r.mu.state.Desc.Replicas[0],
+            Type:       roachpb.LeaseType_EXPIRATION,
+        }
+    } else {
+        // Epoch-based lease (preferred)
+        lease = roachpb.Lease{
+            Start:   r.store.Clock().Now(),
+            Replica: r.mu.state.Desc.Replicas[0],
+            Epoch:   r.store.NodeLiveness().Epoch(r.NodeID()),
+            Type:    roachpb.LeaseType_EPOCH,
+        }
+    }
+    
+    // Propose lease acquisition through Raft
+    return r.proposeLease(ctx, lease)
+}
+```
+
+#### 4.3.2 Lease Transfers
+
+Leases can be transferred cooperatively for load balancing:
+
+```go
+// From pkg/kv/kvserver/replica_range_lease.go
+func (r *Replica) AdminTransferLease(
+    ctx context.Context, target roachpb.StoreID, bypassSafetyChecks bool,
+) error {
+    // Verify target is a valid replica
+    desc := r.Desc()
+    _, ok := desc.GetReplicaDescriptorByID(target)
+    if !ok {
+        return errors.Errorf("target %s not in replica set", target)
+    }
+    
+    // Initiate lease transfer
+    return r.transferLease(ctx, target)
+}
+```
+
+### 4.4 Failure Detection and Recovery
+
+CockroachDB implements sophisticated failure detection and recovery mechanisms:
+
+#### 4.4.1 Node Liveness
+
+Node liveness is tracked through a heartbeat mechanism:
+
+```go
+// From pkg/kv/kvserver/liveness/liveness.go
+type NodeLiveness struct {
+    mu struct {
+        sync.RWMutex
+        nodes map[roachpb.NodeID]Record
+    }
+    
+    heartbeatInterval time.Duration
+    livenessThreshold time.Duration
+}
+
+func (nl *NodeLiveness) heartbeat(ctx context.Context) error {
+    // Update own liveness record
+    oldLiveness, err := nl.getSelf()
+    if err != nil {
+        return err
+    }
+    
+    newLiveness := oldLiveness
+    newLiveness.Expiration = nl.clock.Now().Add(nl.livenessThreshold)
+    newLiveness.Epoch++
+    
+    // Write to KV store
+    return nl.updateLiveness(ctx, oldLiveness, newLiveness)
+}
+```
+
+#### 4.4.2 Range Recovery
+
+When a node fails, its ranges must be re-replicated:
+
+```go
+// From pkg/kv/kvserver/replicate_queue.go
+func (rq *replicateQueue) processOneChange(
+    ctx context.Context, r *Replica,
+) error {
+    desc := r.Desc()
+    action, _ := rq.allocator.ComputeAction(ctx, r.SpanConfig(), desc)
+    
+    switch action {
+    case AllocatorAddVoter:
+        // Find target store for new replica
+        target, _ := rq.allocator.AllocateVoter(ctx, desc.Replicas)
+        if target == nil {
+            return nil
+        }
+        
+        // Add new replica
+        return r.ChangeReplicas(ctx, roachpb.ADD_VOTER, target)
+        
+    case AllocatorRemoveVoter:
+        // Remove dead or decommissioning replica
+        target, _ := rq.allocator.RemoveVoter(ctx, desc.Replicas)
+        if target == nil {
+            return nil
+        }
+        
+        return r.ChangeReplicas(ctx, roachpb.REMOVE_VOTER, target)
+    }
+    
+    return nil
+}
+```
+
+### 4.5 Distributed Coordination
+
+CockroachDB implements several distributed coordination primitives:
+
+#### 4.5.1 Gossip Protocol
+
+The gossip protocol disseminates cluster metadata:
+
+```go
+// From pkg/gossip/gossip.go
+type Gossip struct {
+    mu struct {
+        sync.RWMutex
+        
+        // Node connectivity
+        incoming nodeSet
+        outgoing nodeSet
+        
+        // Information store
+        info     infoStore
+        
+        // Callbacks for updates
+        callbacks []*callback
+    }
+}
+
+func (g *Gossip) AddInfo(key string, val []byte, ttl time.Duration) error {
+    g.mu.Lock()
+    defer g.mu.Unlock()
+    
+    // Add to local info store
+    info := g.mu.info.addInfo(key, val, ttl)
+    
+    // Trigger callbacks
+    g.maybeTriggerCallbacks(info)
+    
+    // Mark for propagation
+    g.mu.outgoing.addToQueue(info)
+    
+    return nil
+}
+```
+
+#### 4.5.2 Distributed Locks
+
+Distributed locks are implemented using the Raft log:
+
+```go
+// From pkg/kv/kvserver/concurrency/lock_table.go
+type lockTableImpl struct {
+    mu struct {
+        sync.Mutex
+        locks map[string]*lockState
+    }
+}
+
+func (lt *lockTableImpl) AcquireLock(
+    ctx context.Context, key roachpb.Key, txn *roachpb.Transaction,
+) error {
+    lt.mu.Lock()
+    defer lt.mu.Unlock()
+    
+    lock, ok := lt.mu.locks[string(key)]
+    if !ok {
+        // Create new lock
+        lock = &lockState{
+            key: key,
+            holder: txn,
+        }
+        lt.mu.locks[string(key)] = lock
+        return nil
+    }
+    
+    // Check for conflicts
+    if lock.holder.ID != txn.ID {
+        return &LockConflictError{
+            Locks: []roachpb.Lock{{Key: key, Holder: lock.holder}},
+        }
+    }
+    
+    return nil
+}
+```
+
+### 4.6 Trade-offs in Distributed Design
+
+The distributed systems core makes several important trade-offs:
+
+#### 4.6.1 Consistency vs. Availability
+
+CockroachDB chooses consistency over availability (CP in CAP theorem):
+
+- **Advantage**: Strong consistency guarantees, no split-brain scenarios
+- **Disadvantage**: Unavailability during network partitions without quorum
+
+#### 4.6.2 Granularity of Distribution
+
+The choice of range size (default 512MB) balances several factors:
+
+- **Smaller ranges**: Better load distribution, faster rebalancing
+- **Larger ranges**: Less metadata overhead, fewer Raft groups
+
+#### 4.6.3 Lease vs. Leader Coupling
+
+CockroachDB attempts to colocate range leases with Raft leaders:
+
+```go
+// From pkg/kv/kvserver/replica_raft.go
+func (r *Replica) maybeTransferRaftLeadershipToLeaseholderLocked(
+    ctx context.Context, leaseStatus kvserverpb.LeaseStatus,
+) {
+    if !leaseStatus.Lease.OwnedBy(r.store.StoreID()) {
+        // Transfer leadership to leaseholder
+        r.mu.raftGroup.TransferLeader(uint64(leaseStatus.Lease.Replica.ReplicaID))
+    }
+}
+```
+
+This optimization reduces the latency of write operations by avoiding an extra network hop.
+
+### 4.7 Scalability Considerations
+
+The distributed architecture is designed to scale horizontally:
+
+1. **Linear Scalability**: Adding nodes increases capacity proportionally
+2. **Automatic Sharding**: No manual partition management required
+3. **Dynamic Load Balancing**: Continuous optimization of data placement
+4. **Multi-Region Support**: Native support for geo-distributed deployments
+
+The distributed systems core provides the foundation for CockroachDB's scalability, fault tolerance, and strong consistency guarantees. Through careful implementation of proven distributed systems algorithms and continuous optimization, the system achieves enterprise-grade reliability while maintaining operational simplicity.
