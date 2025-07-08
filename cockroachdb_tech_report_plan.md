@@ -36,11 +36,11 @@
   - Performance optimizations
 
 ### Phase 4: Transaction Processing
-- [ ] 4.1 Transaction Execution Flow (4,000 words)
+- [x] 4.1 Transaction Execution Flow (4,000 words)
   - MVCC transactions
   - Timestamp management
   - Isolation levels
-- [ ] 4.2 Distributed Transaction Protocol (4,000 words)
+- [x] 4.2 Distributed Transaction Protocol (4,000 words)
   - Two-phase commit avoidance
   - Write intents
   - Transaction conflicts and resolution

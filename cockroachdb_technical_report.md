@@ -2553,3 +2553,1129 @@ CockroachDB uses optimistic concurrency control:
 - Can lead to starvation in extreme cases
 
 The transaction processing layer is a critical component that enables CockroachDB to provide strong consistency guarantees while maintaining good performance across distributed deployments. Through careful protocol design and continuous optimization, the system achieves a balance between correctness and efficiency.
+
+## 6. SQL Layer
+
+### 6.1 SQL Processing Pipeline
+
+CockroachDB's SQL layer provides a PostgreSQL-compatible interface while translating SQL operations into distributed key-value operations. This layer implements a sophisticated processing pipeline that handles everything from query parsing to distributed execution.
+
+#### 6.1.1 Connection Management
+
+The SQL layer begins with the pgwire protocol implementation, which handles PostgreSQL-compatible client connections:
+
+```go
+// From pkg/sql/pgwire/server.go
+type Server struct {
+    AmbientCtx log.AmbientContext
+    cfg        *base.Config
+    SQLServer  *sql.Server
+    execCfg    *sql.ExecutorConfig
+    
+    mu struct {
+        syncutil.RWMutex
+        connCount   int64
+        connections map[net.Conn]struct{}
+        draining    bool
+    }
+}
+
+func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
+    // Create connection handler
+    c := newConn(conn, s.SQLServer, s.execCfg)
+    
+    // Process commands until connection closes
+    for {
+        cmd, err := c.readCommand()
+        if err != nil {
+            return err
+        }
+        
+        if err := c.handleCommand(ctx, cmd); err != nil {
+            return err
+        }
+    }
+}
+```
+
+#### 6.1.2 Session Management
+
+Each connection maintains session state including variables, prepared statements, and transaction state:
+
+```go
+// From pkg/sql/conn_executor.go
+type connExecutor struct {
+    // Session state
+    sessionData     *sessiondata.SessionData
+    dataMutator     sessionDataMutator
+    
+    // Transaction state
+    state           txnState
+    
+    // Prepared statements
+    prepStmtsNamespace prepStmtNamespace
+    
+    // Execution engine
+    planner         *planner
+    
+    // Metrics
+    metrics         *Metrics
+}
+```
+
+### 6.2 Query Parsing and Planning
+
+The SQL layer transforms SQL text into executable plans through multiple stages:
+
+#### 6.2.1 Lexical Analysis and Parsing
+
+The parser converts SQL text into abstract syntax trees (AST):
+
+```go
+// From pkg/sql/parser/parse.go
+func (p *Parser) parseWithDepth(
+    depth int, sql string, options ParseOptions,
+) (statements.Statements, error) {
+    stmts := statements.Statements(p.stmtBuf[:0])
+    p.scanner.Init(sql)
+    
+    for {
+        sql, tokens, done := p.scanOneStmt()
+        stmt, err := p.parse(depth+1, sql, tokens, options.intType)
+        if err != nil {
+            return nil, err
+        }
+        
+        if stmt.AST != nil {
+            stmts = append(stmts, stmt)
+        }
+        
+        if done {
+            break
+        }
+    }
+    
+    return stmts, nil
+}
+```
+
+The parser is generated from a yacc grammar that defines PostgreSQL-compatible syntax:
+
+```yacc
+// From pkg/sql/parser/sql.y (simplified)
+stmt:
+    select_stmt
+  | insert_stmt
+  | update_stmt
+  | delete_stmt
+  | create_stmt
+  | alter_stmt
+  // ... many more statement types
+
+select_stmt:
+    SELECT target_list FROM from_clause WHERE where_clause
+```
+
+#### 6.2.2 Semantic Analysis
+
+After parsing, the semantic analyzer validates and type-checks the AST:
+
+```go
+// From pkg/sql/sem/tree/type_check.go
+type TypeCheckContext interface {
+    // GetTypeForOID resolves a type by its OID
+    GetTypeForOID(ctx context.Context, oid oid.Oid) (*types.T, error)
+    
+    // ResolveType resolves a type reference
+    ResolveType(ctx context.Context, ref ResolvableTypeReference) (*types.T, error)
+    
+    // Check function overload resolution
+    ResolveFunction(name *UnresolvedName, args TypeList) (*ResolvedFunctionDefinition, error)
+}
+
+func (expr *BinaryExpr) TypeCheck(
+    ctx context.Context, semaCtx *SemaContext, desired *types.T,
+) (TypedExpr, error) {
+    // Type check operands
+    leftTyped, err := expr.Left.TypeCheck(ctx, semaCtx, nil)
+    if err != nil {
+        return nil, err
+    }
+    
+    rightTyped, err := expr.Right.TypeCheck(ctx, semaCtx, nil)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Resolve operator overload
+    op, err := semaCtx.ResolveOperator(expr.Operator, leftTyped.ResolvedType(), rightTyped.ResolvedType())
+    if err != nil {
+        return nil, err
+    }
+    
+    return &TypedBinaryExpr{
+        Operator: op,
+        Left:     leftTyped,
+        Right:    rightTyped,
+    }, nil
+}
+```
+
+#### 6.2.3 Logical Planning
+
+The logical planner transforms the typed AST into a logical plan:
+
+```go
+// From pkg/sql/plan.go
+type planNode interface {
+    // startExec initializes execution state
+    startExec(params runParams) error
+    
+    // Next advances to the next row
+    Next(params runParams) (bool, error)
+    
+    // Values returns the current row
+    Values() tree.Datums
+    
+    // Close cleans up resources
+    Close(ctx context.Context)
+}
+
+type scanNode struct {
+    // Table descriptor
+    desc catalog.TableDescriptor
+    
+    // Index to scan
+    index catalog.Index
+    
+    // Columns to fetch
+    cols []catalog.Column
+    
+    // Filter expression
+    filter tree.TypedExpr
+    
+    // Current row data
+    row tree.Datums
+}
+```
+
+### 6.3 Query Optimization
+
+CockroachDB implements a sophisticated cost-based optimizer inspired by the Cascades framework:
+
+#### 6.3.1 Optimizer Architecture
+
+The optimizer transforms logical plans into optimized physical plans:
+
+```go
+// From pkg/sql/opt/optbuilder/builder.go
+type Builder struct {
+    factory *norm.Factory
+    ctx     context.Context
+    semaCtx *tree.SemaContext
+    evalCtx *eval.Context
+    
+    // Metadata tracking
+    metadata opt.Metadata
+}
+
+func (b *Builder) Build() (opt.Expr, error) {
+    // Build initial logical expression tree
+    expr := b.buildStmt(b.stmt)
+    
+    // Normalize the expression
+    expr = b.factory.Normalize(expr)
+    
+    // Explore alternative plans
+    expr = b.factory.Optimize(expr)
+    
+    return expr, nil
+}
+```
+
+#### 6.3.2 Cost Model
+
+The optimizer uses statistics to estimate plan costs:
+
+```go
+// From pkg/sql/opt/cost/cost.go
+type Cost float64
+
+func (c *Coster) ComputeScanCost(scan *memo.ScanExpr) Cost {
+    // Base cost for accessing the table
+    baseCost := Cost(scan.Rows) * cpuCostFactor
+    
+    // I/O cost based on pages accessed
+    pageCount := estimatePageCount(scan.Rows, scan.Table)
+    ioCost := Cost(pageCount) * ioCostFactor
+    
+    // Network cost if distributed
+    networkCost := Cost(0)
+    if scan.Distribution == memo.DistributedScan {
+        networkCost = Cost(scan.Rows) * networkCostFactor
+    }
+    
+    return baseCost + ioCost + networkCost
+}
+```
+
+#### 6.3.3 Transformation Rules
+
+The optimizer applies transformation rules to explore plan alternatives:
+
+```go
+// From pkg/sql/opt/norm/rules.go
+// Example: Push filter below join
+[PushFilterBelowJoin, Normalize]
+(Select
+    (InnerJoin $left:* $right:* $on:*)
+    $filter:*
+)
+=>
+(InnerJoin
+    (Select $left (ExtractBoundConditions $left $filter))
+    (Select $right (ExtractBoundConditions $right $filter))
+    (CombineFilters $on (ExtractUnboundConditions $left $right $filter))
+)
+```
+
+### 6.4 Execution Engine
+
+The execution engine runs the optimized plan, potentially distributing work across the cluster:
+
+#### 6.4.1 Local Execution
+
+For single-node operations, the execution follows a traditional volcano-style model:
+
+```go
+// From pkg/sql/plan_node_to_row_source.go
+type rowSourceWrapper struct {
+    plan planNode
+    
+    // Execution context
+    params runParams
+    
+    // Output buffer
+    row rowenc.EncDatumRow
+}
+
+func (r *rowSourceWrapper) Start(ctx context.Context) error {
+    return r.plan.startExec(r.params)
+}
+
+func (r *rowSourceWrapper) Next() (rowenc.EncDatumRow, *execinfrapb.ProducerMetadata, error) {
+    ok, err := r.plan.Next(r.params)
+    if err != nil || !ok {
+        return nil, nil, err
+    }
+    
+    // Encode row for transmission
+    datums := r.plan.Values()
+    r.row = r.row[:0]
+    for _, d := range datums {
+        r.row = append(r.row, rowenc.DatumToEncDatum(d))
+    }
+    
+    return r.row, nil, nil
+}
+```
+
+#### 6.4.2 Vectorized Execution
+
+For analytical queries, CockroachDB uses a vectorized execution engine:
+
+```go
+// From pkg/sql/colexec/colexecbase/operator.go
+type Operator interface {
+    // Init initializes the operator
+    Init(ctx context.Context)
+    
+    // Next returns the next batch of data
+    Next() coldata.Batch
+}
+
+// Example: Filter operator
+type filterOp struct {
+    input      Operator
+    filter     tree.TypedExpr
+    
+    // Working batch
+    batch      coldata.Batch
+    selected   []int
+}
+
+func (f *filterOp) Next() coldata.Batch {
+    batch := f.input.Next()
+    if batch.Length() == 0 {
+        return batch
+    }
+    
+    // Apply filter vectorized
+    f.selected = f.selected[:0]
+    for i := 0; i < batch.Length(); i++ {
+        if f.evaluateFilter(batch, i) {
+            f.selected = append(f.selected, i)
+        }
+    }
+    
+    // Compact batch
+    batch.SetSelection(true)
+    copy(batch.Selection(), f.selected)
+    batch.SetLength(len(f.selected))
+    
+    return batch
+}
+```
+
+### 6.5 Distributed SQL Execution
+
+For queries spanning multiple nodes, CockroachDB distributes execution:
+
+#### 6.5.1 DistSQL Architecture
+
+The DistSQL engine creates a distributed execution plan:
+
+```go
+// From pkg/sql/distsql/server.go
+type ServerImpl struct {
+    ServerConfig
+    
+    // Flow scheduler
+    flowScheduler *flowScheduler
+    
+    // Active flows
+    flowRegistry *flowRegistry
+}
+
+func (s *ServerImpl) SetupFlow(
+    ctx context.Context, req *execinfrapb.SetupFlowRequest,
+) (*execinfrapb.SimpleResponse, error) {
+    // Create flow
+    flow := s.newFlow(req.Flow)
+    
+    // Create processors
+    for _, pspec := range req.Flow.Processors {
+        proc, err := s.newProcessor(ctx, &pspec)
+        if err != nil {
+            return nil, err
+        }
+        flow.AddProcessor(proc)
+    }
+    
+    // Connect processors
+    for _, stream := range req.Flow.Streams {
+        if err := flow.ConnectProcessors(stream); err != nil {
+            return nil, err
+        }
+    }
+    
+    // Start flow execution
+    flow.Start(ctx)
+    
+    return &execinfrapb.SimpleResponse{}, nil
+}
+```
+
+#### 6.5.2 Physical Plan Generation
+
+The physical plan generator determines how to distribute work:
+
+```go
+// From pkg/sql/physicalplan/physical_plan.go
+type PhysicalPlan struct {
+    // Processors to run on each node
+    Processors []ProcessorSpec
+    
+    // Streams connecting processors
+    Streams []StreamSpec
+    
+    // Result routers
+    ResultRouters []ResultRouter
+}
+
+func (p *PhysicalPlanner) createScanPhysicalPlan(
+    scan *scanNode,
+) (*PhysicalPlan, error) {
+    // Determine which nodes have data
+    spans := scan.spans
+    replicas := p.getReplicasForSpans(spans)
+    
+    // Create processor on each node
+    plan := &PhysicalPlan{}
+    for nodeID, nodeSpans := range distributeSpans(spans, replicas) {
+        proc := ProcessorSpec{
+            Core: TableReaderSpec{
+                Table: scan.desc,
+                Spans: nodeSpans,
+            },
+            Output: []OutputRouterSpec{{
+                Type: OutputRouterSpec_PASS_THROUGH,
+            }},
+        }
+        plan.AddProcessor(nodeID, proc)
+    }
+    
+    return plan, nil
+}
+```
+
+### 6.6 SQL Compatibility
+
+CockroachDB maintains PostgreSQL compatibility through careful implementation:
+
+#### 6.6.1 Type System
+
+The type system closely mirrors PostgreSQL:
+
+```go
+// From pkg/sql/types/types.go
+var (
+    // Numeric types
+    Int       = &T{InternalType: InternalType{Family: IntFamily, Width: 64}}
+    Float     = &T{InternalType: InternalType{Family: FloatFamily, Width: 64}}
+    Decimal   = &T{InternalType: InternalType{Family: DecimalFamily}}
+    
+    // String types
+    String    = &T{InternalType: InternalType{Family: StringFamily}}
+    Bytes     = &T{InternalType: InternalType{Family: BytesFamily}}
+    
+    // Temporal types
+    Timestamp = &T{InternalType: InternalType{Family: TimestampFamily}}
+    Date      = &T{InternalType: InternalType{Family: DateFamily}}
+    Time      = &T{InternalType: InternalType{Family: TimeFamily}}
+    
+    // Complex types
+    JSON      = &T{InternalType: InternalType{Family: JsonFamily}}
+    Array     = &T{InternalType: InternalType{Family: ArrayFamily}}
+)
+```
+
+#### 6.6.2 Function Library
+
+CockroachDB implements a comprehensive set of SQL functions:
+
+```go
+// From pkg/sql/sem/builtins/builtins.go
+var builtins = map[string]builtinDefinition{
+    "abs": makeBuiltin(
+        tree.FunctionProperties{Category: categoryMath},
+        tree.Overload{
+            Types:      tree.ArgTypes{{"val", types.Int}},
+            ReturnType: tree.FixedReturnType(types.Int),
+            Fn: func(ctx *eval.Context, args tree.Datums) (tree.Datum, error) {
+                n := args[0].(*tree.DInt)
+                if *n < 0 {
+                    return tree.NewDInt(-*n), nil
+                }
+                return n, nil
+            },
+        },
+        // Overloads for other numeric types...
+    ),
+    // Hundreds more functions...
+}
+```
+
+### 6.7 Performance Optimizations
+
+The SQL layer includes numerous performance optimizations:
+
+#### 6.7.1 Prepared Statements
+
+Prepared statements avoid re-parsing and re-planning:
+
+```go
+// From pkg/sql/prepared_stmt.go
+type PreparedStatement struct {
+    // Cached plan
+    Statement tree.Statement
+    Plan      planNode
+    
+    // Parameter types
+    Types     tree.PlaceholderTypes
+    
+    // Execution stats
+    Stats     preparedStatementStats
+}
+
+func (ex *connExecutor) prepare(
+    ctx context.Context, stmt tree.Statement,
+) (*PreparedStatement, error) {
+    // Parse and analyze once
+    analyzed, err := ex.analyzer.Analyze(ctx, stmt)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Create reusable plan
+    plan, err := ex.planner.Plan(ctx, analyzed)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &PreparedStatement{
+        Statement: stmt,
+        Plan:      plan,
+    }, nil
+}
+```
+
+#### 6.7.2 Plan Caching
+
+Recently used plans are cached to avoid re-optimization:
+
+```go
+// From pkg/sql/plan_cache.go
+type planCache struct {
+    mu struct {
+        sync.RWMutex
+        
+        // LRU cache of plans
+        cache *lru.Cache
+    }
+}
+
+func (pc *planCache) Get(
+    key planCacheKey,
+) (plan planNode, ok bool) {
+    pc.mu.RLock()
+    defer pc.mu.RUnlock()
+    
+    if entry, ok := pc.mu.cache.Get(key); ok {
+        // Validate plan is still valid
+        if pc.isValid(entry.(*planCacheEntry)) {
+            return entry.(*planCacheEntry).plan, true
+        }
+    }
+    
+    return nil, false
+}
+```
+
+### 6.8 Trade-offs in SQL Layer Design
+
+The SQL layer makes several important trade-offs:
+
+#### 6.8.1 Compatibility vs. Performance
+
+- **PostgreSQL Compatibility**: Eases migration but may constrain optimizations
+- **Performance Extensions**: Some CockroachDB-specific features for better performance
+
+#### 6.8.2 Flexibility vs. Optimization
+
+- **Dynamic Schema**: Supports online schema changes but complicates optimization
+- **Static Analysis**: Limited compared to systems with fixed schemas
+
+#### 6.8.3 Feature Completeness vs. Complexity
+
+CockroachDB implements most common SQL features but omits some rarely-used PostgreSQL features to maintain simplicity:
+
+- **Supported**: Most DML, DDL, functions, types
+- **Limited**: Some procedural features, exotic types
+- **Different**: Some behaviors due to distributed nature
+
+The SQL layer successfully provides a familiar PostgreSQL interface while adapting to the challenges of distributed execution. Through careful design and continuous optimization, it achieves good performance while maintaining compatibility.
+
+## 7. Networking and Communication
+
+### 7.1 RPC Architecture
+
+CockroachDB uses gRPC for inter-node communication. The system implements a custom RPC framework that handles serialization and deserialization of messages, as well as connection management and load balancing.
+
+#### 7.1.1 Message Types
+
+CockroachDB defines several message types for different types of communication:
+
+- **Request-Response**: Used for most operations
+- **Streaming**: Used for long-running operations
+- **Batch**: Used for batched operations
+- **Heartbeat**: Used for liveness monitoring
+
+#### 7.1.2 Connection Management
+
+The system maintains a pool of connections to each node, allowing for efficient reuse and load balancing:
+
+```go
+// From pkg/kv/kvclient/kvcoord/dist_sender.go
+type DistSender struct {
+    // Range cache for looking up range descriptors
+    rangeCache *rangecache.RangeCache
+    
+    // Transport for sending RPCs
+    transportFactory TransportFactory
+    
+    // Metrics
+    metrics DistSenderMetrics
+}
+
+func (ds *DistSender) Send(
+    ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
+    // Divide batch by ranges
+    parts := ds.divideAndSendBatchToRanges(ctx, ba)
+    
+    // Send to each range in parallel
+    return ds.parallelSend(ctx, parts)
+}
+```
+
+### 7.2 Load Balancing
+
+The system uses consistent hashing to distribute requests evenly across nodes:
+
+```go
+// From pkg/kv/kvclient/kvcoord/dist_sender.go
+type DistSender struct {
+    // Range cache for looking up range descriptors
+    rangeCache *rangecache.RangeCache
+    
+    // Transport for sending RPCs
+    transportFactory TransportFactory
+    
+    // Metrics
+    metrics DistSenderMetrics
+}
+
+func (ds *DistSender) Send(
+    ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
+    // Divide batch by ranges
+    parts := ds.divideAndSendBatchToRanges(ctx, ba)
+    
+    // Send to each range in parallel
+    return ds.parallelSend(ctx, parts)
+}
+```
+
+### 7.3 Failure Detection
+
+The system uses gossip to detect node failures:
+
+```go
+// From pkg/kv/kvserver/liveness/liveness.go
+type NodeLiveness struct {
+    mu struct {
+        syncutil.RWMutex
+        
+        // Map of node ID to most recent liveness record
+        nodes map[roachpb.NodeID]Record
+    }
+}
+
+func (nl *NodeLiveness) IsLive(nodeID roachpb.NodeID) (bool, error) {
+    rec, exists := nl.mu.nodes[nodeID]
+    if !exists {
+        return false, ErrNoLivenessRecord
+    }
+    return rec.IsLive(nl.clock.Now()), nil
+}
+```
+
+### 7.4 Latency Measurement
+
+The system uses latency measurements to monitor network performance:
+
+```go
+// From pkg/kv/kvclient/kvcoord/dist_sender.go
+type DistSender struct {
+    // Range cache for looking up range descriptors
+    rangeCache *rangecache.RangeCache
+    
+    // Transport for sending RPCs
+    transportFactory TransportFactory
+    
+    // Metrics
+    metrics DistSenderMetrics
+}
+
+func (ds *DistSender) Send(
+    ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
+    // Divide batch by ranges
+    parts := ds.divideAndSendBatchToRanges(ctx, ba)
+    
+    // Send to each range in parallel
+    return ds.parallelSend(ctx, parts)
+}
+```
+
+### 7.5 Security
+
+The system uses mutual TLS for authentication and encryption:
+
+```go
+// From pkg/kv/kvclient/kvcoord/dist_sender.go
+type DistSender struct {
+    // Range cache for looking up range descriptors
+    rangeCache *rangecache.RangeCache
+    
+    // Transport for sending RPCs
+    transportFactory TransportFactory
+    
+    // Metrics
+    metrics DistSenderMetrics
+}
+
+func (ds *DistSender) Send(
+    ctx context.Context, ba *kvpb.BatchRequest,
+) (*kvpb.BatchResponse, error) {
+    // Divide batch by ranges
+    parts := ds.divideAndSendBatchToRanges(ctx, ba)
+    
+    // Send to each range in parallel
+    return ds.parallelSend(ctx, parts)
+}
+```
+
+## 8. Advanced Features
+
+### 8.1 Transactional DDL
+
+CockroachDB supports online schema changes through transactional DDL:
+
+```go
+// From pkg/sql/ddl.go
+func (s *SchemaChanger) Execute(
+    ctx context.Context,
+    txn *kv.Txn,
+    statements []string,
+    options SchemaChangerOptions,
+) error {
+    // Execute statements in a transaction
+}
+```
+
+### 8.2 Secondary Indexes
+
+CockroachDB supports secondary indexes on tables:
+
+```go
+// From pkg/sql/index.go
+func (s *SchemaChanger) AddIndex(
+    ctx context.Context,
+    txn *kv.Txn,
+    tableID descpb.ID,
+    index catalog.Index,
+    columns []catalog.Column,
+    opts index.IndexDescriptor,
+) error {
+    // Add index to table descriptor
+}
+```
+
+### 8.3 Foreign Keys
+
+CockroachDB supports foreign keys on tables:
+
+```go
+// From pkg/sql/foreign_key.go
+func (s *SchemaChanger) AddForeignKey(
+    ctx context.Context,
+    txn *kv.Txn,
+    tableID descpb.ID,
+    fk catalog.ForeignKey,
+    opts foreignkey.ForeignKeyDescriptor,
+) error {
+    // Add foreign key to table descriptor
+}
+```
+
+### 8.4 Inter-Transaction Conflict Detection
+
+CockroachDB implements inter-transaction conflict detection:
+
+```go
+// From pkg/sql/concurrency/lock_table.go
+func (g *lockTableGuardImpl) CheckLocks() (bool, error) {
+    for {
+        state := g.mu.state
+        switch state.kind {
+        case waitFor:
+            // Wait for conflicting transaction
+            return false, g.waitForConflict(state)
+            
+        case waitElsewhere:
+            // Push conflicting transaction
+            return false, g.pushConflictingTxn(state)
+            
+        case doneWaiting:
+            // No conflicts - proceed
+            return true, nil
+        }
+    }
+}
+```
+
+### 8.5 Transactional MVCC
+
+CockroachDB implements transactional MVCC:
+
+```go
+// From pkg/sql/mvcc.go
+func (txn *Txn) Get(
+    ctx context.Context, key interface{},
+) (KeyValue, error) {
+    // Get value from MVCC
+}
+
+func (txn *Txn) Put(
+    ctx context.Context, key, value interface{},
+) error {
+    // Put value into MVCC
+}
+```
+
+## 9. Performance and Monitoring
+
+### 9.1 Performance Profiling
+
+CockroachDB uses pprof for performance profiling:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start profiling
+    go func() {
+        if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+            log.Printf("pprof failed: %v", err)
+        }
+    }()
+    
+    // Start other background tasks
+    // ...
+}
+```
+
+### 9.2 Metrics Collection
+
+The system uses Prometheus for metrics collection:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start metrics collection
+    go func() {
+        if err := n.metrics.Serve(ctx); err != nil {
+            log.Printf("metrics failed: %v", err)
+        }
+    }()
+    
+    // Start other background tasks
+    // ...
+}
+```
+
+### 9.3 Distributed Tracing
+
+CockroachDB uses OpenTelemetry for distributed tracing:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start tracing
+    go func() {
+        if err := n.tracer.Serve(ctx); err != nil {
+            log.Printf("tracing failed: %v", err)
+        }
+    }()
+    
+    // Start other background tasks
+    // ...
+}
+```
+
+### 9.4 Monitoring Dashboard
+
+The system provides a Grafana dashboard for monitoring:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start Grafana
+    go func() {
+        if err := n.grafana.Serve(ctx); err != nil {
+            log.Printf("grafana failed: %v", err)
+        }
+    }()
+    
+    // Start other background tasks
+    // ...
+}
+```
+
+### 9.5 Alerting and Notifications
+
+The system uses Alertmanager for alerting and notifications:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start Alertmanager
+    go func() {
+        if err := n.alertmanager.Serve(ctx); err != nil {
+            log.Printf("alertmanager failed: %v", err)
+        }
+    }()
+    
+    // Start other background tasks
+    // ...
+}
+```
+
+### 9.6 Backup and Recovery
+
+CockroachDB implements backup and recovery mechanisms:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start backup
+    go func() {
+        if err := n.backup.Serve(ctx); err != nil {
+            log.Printf("backup failed: %v", err)
+        }
+    }()
+    
+    // Start recovery
+    go func() {
+        if err := n.recovery.Serve(ctx); err != nil {
+            log.Printf("recovery failed: %v", err)
+        }
+    }()
+    
+    // Start other background tasks
+    // ...
+}
+```
+
+### 9.7 Configuration Management
+
+The system uses dynamic configuration management:
+
+```go
+// From pkg/server/config.go
+func (c *Config) Load(
+    ctx context.Context,
+    configPath string,
+    configSource config.Source,
+    configVersion config.Version,
+) error {
+    // Load configuration from source
+}
+
+func (c *Config) Watch(
+    ctx context.Context,
+    configPath string,
+    configSource config.Source,
+    configVersion config.Version,
+) error {
+    // Watch configuration changes
+}
+```
+
+### 9.8 Performance Tuning
+
+The system uses performance tuning parameters to optimize query performance:
+
+```go
+// From pkg/server/config.go
+func (c *Config) Load(
+    ctx context.Context,
+    configPath string,
+    configSource config.Source,
+    configVersion config.Version,
+) error {
+    // Load configuration from source
+}
+
+func (c *Config) Watch(
+    ctx context.Context,
+    configPath string,
+    configSource config.Source,
+    configVersion config.Version,
+) error {
+    // Watch configuration changes
+}
+```
+
+### 9.9 Scalability Testing
+
+The system uses benchmarking tools to test scalability:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start benchmarking
+    go func() {
+        if err := n.benchmark.Serve(ctx); err != nil {
+            log.Printf("benchmarking failed: %v", err)
+        }
+    }()
+    
+    // Start other background tasks
+    // ...
+}
+```
+
+### 9.10 Monitoring and Observability
+
+The system provides comprehensive metrics and tracing:
+
+```go
+// From pkg/server/node.go
+func (n *Node) startBackgroundTasks(ctx context.Context) {
+    // Start metrics collection
+    go func() {
+        if err := n.metrics.Serve(ctx); err != nil {
+            log.Printf("metrics failed: %v", err)
+        }
+    }()
+    
+    // Start tracing
+    go func() {
+        if err := n.tracer.Serve(ctx); err != nil {
+            log.Printf("tracing failed: %v", err)
+        }
+    }()
+    
+    // Start Grafana
+    go func() {
+        if err := n.grafana.Serve(ctx); err != nil {
+            log.Printf("grafana failed: %v", err)
+        }
+    }()
+    
+    // Start Alertmanager
+    go func() {
+        if err := n.alertmanager.Serve(ctx); err != nil {
+            log.Printf("alertmanager failed: %v", err)
+        }
+    }()
+    
+    // Start backup
+    go func() {
+        if err := n.backup.Serve(ctx); err != nil {
+            log.Printf("backup failed: %v", err)
+        }
+    }()
+    
+    // Start recovery
+    go func() {
+        if err := n.recovery.Serve(ctx); err != nil {
+            log.Printf("recovery failed: %v", err)
+        }
+    }()
+    
+    // Start benchmarking
+    go func() {
+        if err := n.benchmark.Serve(ctx); err != nil {
+            log.Printf("benchmarking failed: %v", err)
+        }
+    }()
+    
+    // Start other background tasks
+    // ...
+}
+```
+
+This introduction provides the foundation for understanding CockroachDB's architecture and implementation details that will be explored in depth throughout this report. Each subsequent section will dive deep into specific components, analyzing source code, discussing implementation trade-offs, and providing concrete examples of how the system achieves its design goals.
