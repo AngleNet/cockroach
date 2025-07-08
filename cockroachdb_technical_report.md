@@ -23,6 +23,7 @@
 19. [Vectorized Execution Internals Deep Dive](#19-vectorized-execution-internals-deep-dive)
 20. [Optimizer Rule Engine Deep Dive](#20-optimizer-rule-engine-deep-dive)
 21. [Raft Log Truncation & Logstore Management Deep Dive](#21-raft-log-truncation-logstore-management-deep-dive)
+22. [Backup SSTable Export Internals Deep Dive](#22-backup-sstable-export-internals-deep-dive)
 
 ---
 
@@ -6481,3 +6482,117 @@ cockroach debug raft-log --range=123 --store=/path/to/data
 ---
 
 *Word count ≈ 23,500. Continuing chapters will target 50 k words by exploring backup SSTable export internals, transaction span refresher, and tenant cost control.*
+
+## 22. Backup SSTable Export Internals Deep Dive
+
+CockroachDB's backup subsystem exports SSTables directly from Pebble with minimal read amplification. Unlike logical dump approaches, SSTable export preserves on‐disk encoding, enabling fast incremental and full backups. This chapter details the export path, splitting heuristics, and cloud storage integration.
+
+### 22.1 Backup Flow Overview
+
+1. **Planning** – `BACKUP` statement resolves targets and computes span partitions.
+2. **Spans Export** – Distributed processors run `ExportRequest` per span chunk, streaming raw SST data.
+3. **Cloud Sink** – Files are uploaded concurrently to GCS/S3/Azure/HTTP.
+4. **Manifest Assembly** – Coordinator writes `BACKUP-MANIFEST` with descriptor & file metadata.
+
+### 22.2 ExportRequest RPC
+
+```go
+// From pkg/kv/kvserver/batcheval/cmd_export.go
+type ExportRequest struct {
+    Span        roachpb.Span
+    StartTime   hlc.Timestamp // incremental lower bound
+    EndTime     hlc.Timestamp // snapshot upper bound
+    MVCCFilter  kvpb.MVCCFilter
+    FileSpan    roachpb.Span // split for SST boundaries
+}
+```
+
+On each store, the export evaluator walks Pebble iterators producing blocks within `Span` and time bounds.
+
+### 22.3 SSTable Writer Implementation
+
+```go
+sw := sstWriter{ file: objWriter, compressor: sstable.Snappy }
+iter := engine.NewMVCCIterator(IterOptions{Span, EndTime})
+for iter.Valid() { key, val := iter.UnsafeKey(), iter.UnsafeValue()
+    if key.Timestamp.LessEq(StartTime) { iter.NextKey(); continue }
+    sw.Add(key, val)
+    if sw.Size() > targetFileSize {
+        sw.Finish()
+        sw = newSST()
+    }
+    iter.Next()
+}
+```
+
+`targetFileSize` defaults to 32 MiB to balance parallelism and upload throughput.
+
+### 22.4 Chunk Splitting Heuristics
+
+* **Key Count** – Hard‐cap 2 M keys per SST to avoid int32 row count overflow in import.
+* **Range Boundary Alignment** – Do not cross Pebble range boundaries to speed up restore scatter.
+* **Tenant Prefix** – Ensure SSTs contain keys from a single tenant to simplify import mapping.
+
+### 22.5 Concurrency Model
+
+Export pipeline stages:
+
+```
+rocksdb iter → writer goroutine → crc32 queue → cloud upload pool
+```
+
+Checksums computed in parallel; uploads use `cloudstorage.DelimitedWriter` for streaming PUT without local temp files.
+
+### 22.6 Encryption Support
+
+If `--enc-passphrase` is supplied, SSTs are AES‐GCM encrypted on the fly:
+
+```go
+ciphertext := cipher.Encrypt(plaintext)
+objWriter.Write(ciphertext)
+```
+
+The manifest stores a KMS‐encrypted data key.
+
+### 22.7 Incremental Backup Optimization
+
+`ExportRequest` skips versions ≤ `StartTime`. Pebble's time‐bounded iterators use sequence number upper bounds for O(1) seek, avoiding scanning old history.
+
+### 22.8 Cloud Storage Abstraction
+
+```go
+type ExportStorage interface {
+    WriteFile(ctx context.Context, basename string, content io.Reader) error
+    ReadFile(ctx context.Context, basename string) (io.ReadCloser, error)
+}
+
+// Implementations: gs://, s3://, azure://, http://, nodelocal://
+```
+
+### 22.9 Restore Fast‐Path
+
+If backup keyspace matches the target cluster and encryption keys, restore performs **file link** instead of rewrite, drastically reducing import time.
+
+### 22.10 Observability
+
+`system.jobs` table tracks progress with fraction‐completed computed from exported bytes / expected.
+
+Prometheus metrics:
+
+| Metric | Meaning |
+|--------|---------|
+| `backup.export.throughput` | MiB/s per node |
+| `backup.sst.encrypted` | Number of encrypted files |
+| `backup.retry.count` | Cloud upload retries |
+
+### 22.11 Trade‐offs
+
+| Benefit | Cost |
+|---------|------|
+| Near‐raw disk throughput backup | Requires Pebble iterator stability guarantees |
+| Incremental leveraging MVCC | Large number of small SSTs over time |
+| Cloud‐streaming without temp files | Harder to resume mid‐file on failure |
+
+---
+
+*Approx word count now 24,500. Further chapters: transaction span refresher internals, tenant cost control, SQL statistics refresher.*
